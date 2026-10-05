@@ -371,9 +371,13 @@ class ExportStudioDialog(QDialog):
         geometry: Any,
         render_options: ExportOptions,
         parent: QWidget | None = None,
+        *,
+        regions: list[tuple[str, float, float]] | None = None,
     ) -> None:
         super().__init__(parent)
         self.analysis = analysis
+        # Bookmark regions offered as ready-made time ranges: (label, start, end).
+        self.regions = list(regions or [])
         self.geometry = geometry
         audio_path = Path(str(getattr(analysis, "audio_path", "") or "")).expanduser()
         self.has_source_audio = bool(str(audio_path) and audio_path.is_file())
@@ -546,6 +550,14 @@ class ExportStudioDialog(QDialog):
         self.end_spin.setValue(duration)
         self.end_spin.setSuffix(" s")
         self.end_spin.valueChanged.connect(self._range_changed)
+        self.region_combo = QComboBox()
+        self.region_combo.addItem("Full source", None)
+        for label, start, end in self.regions:
+            self.region_combo.addItem(f"{label} ({start:.2f}–{end:.2f} s)", (float(start), float(end)))
+        self.region_combo.setEnabled(bool(self.regions))
+        self.region_combo.setToolTip("Use a bookmark region as the export range")
+        self.region_combo.currentIndexChanged.connect(self._region_selected)
+        range_form.addRow("Region", self.region_combo)
         range_form.addRow("Start", self.start_spin)
         range_form.addRow("End", self.end_spin)
         layout.addWidget(range_group)
@@ -886,6 +898,15 @@ class ExportStudioDialog(QDialog):
                 self.quality_spin.setValue(self._video_quality)
         self._last_format_key = definition.key
         self._update_estimate()
+
+    def _region_selected(self, _index: int) -> None:
+        span = self.region_combo.currentData()
+        duration = float(max(0.0, getattr(self.analysis, "duration", 0.0)))
+        start, end = (0.0, duration) if span is None else span
+        with QSignalBlocker(self.start_spin), QSignalBlocker(self.end_spin):
+            self.start_spin.setValue(start)
+            self.end_spin.setValue(end)
+        self._range_changed()
 
     def _range_changed(self) -> None:
         if self.end_spin.value() < self.start_spin.value():

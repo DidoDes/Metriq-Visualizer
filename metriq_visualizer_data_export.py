@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from metriq_visualizer_atomic import atomic_destination
+from metriq_visualizer_bookmarks import Bookmark, bookmarks_to_payload
 from metriq_visualizer_core import AnalysisResult, GeometryResult
 
 DATA_EXPORT_SCHEMA = "metriq.analysis-data"
@@ -69,32 +71,86 @@ def _columns(analysis: AnalysisResult, geometry: GeometryResult | None) -> tuple
     return names, aligned
 
 
-def export_analysis_csv(path: str | Path, analysis: AnalysisResult, geometry: GeometryResult | None = None) -> Path:
+def _row_mask(times: np.ndarray, time_range: tuple[float, float] | None) -> np.ndarray:
+    """Rows whose timestamp falls inside the inclusive *time_range*."""
+
+    values = np.asarray(times, dtype=np.float64).reshape(-1)
+    if time_range is None:
+        return np.ones(values.size, dtype=bool)
+    start, end = sorted((float(time_range[0]), float(time_range[1])))
+    return (values >= start - 1e-9) & (values <= end + 1e-9)
+
+
+def _bookmark_labels(times: np.ndarray, bookmarks: Sequence[Bookmark]) -> list[str]:
+    """Label each row with the regions containing it and the points nearest to it."""
+
+    values = np.asarray(times, dtype=np.float64).reshape(-1)
+    labels: list[list[str]] = [[] for _ in range(values.size)]
+    if values.size == 0:
+        return []
+    for item in bookmarks:
+        if item.end is not None:
+            for index in np.flatnonzero((values >= item.start) & (values <= item.end)):
+                labels[int(index)].append(item.label)
+        else:
+            labels[int(np.argmin(np.abs(values - item.start)))].append(item.label)
+    return ["; ".join(entry) for entry in labels]
+
+
+def export_analysis_csv(
+    path: str | Path,
+    analysis: AnalysisResult,
+    geometry: GeometryResult | None = None,
+    *,
+    time_range: tuple[float, float] | None = None,
+    bookmarks: Sequence[Bookmark] | None = None,
+) -> Path:
+    """Write one row per analysis frame, optionally limited to *time_range*.
+
+    With *bookmarks*, a trailing ``bookmark`` column names the regions that
+    contain each row and the points nearest to it.
+    """
+
     output = Path(path).expanduser()
     if output.suffix.lower() != ".csv":
         output = output.with_suffix(".csv")
     output.parent.mkdir(parents=True, exist_ok=True)
     names, arrays = _columns(analysis, geometry)
+    labels = _bookmark_labels(analysis.times, bookmarks) if bookmarks else None
+    rows = np.flatnonzero(_row_mask(analysis.times, time_range))
     with atomic_destination(output) as temporary, temporary.open(
         "w", newline="", encoding="utf-8"
     ) as handle:
         writer = csv.writer(handle)
-        writer.writerow(names)
-        for row_index in range(analysis.times.size):
+        writer.writerow([*names, "bookmark"] if labels is not None else names)
+        for row_index in rows:
             row: list[Any] = []
             for values in arrays:
                 value = values[row_index]
                 row.append("" if not np.isfinite(value) else f"{float(value):.10g}")
+            if labels is not None:
+                row.append(labels[row_index])
             writer.writerow(row)
     return output.resolve()
 
 
-def export_analysis_npz(path: str | Path, analysis: AnalysisResult, geometry: GeometryResult | None = None) -> Path:
+def export_analysis_npz(
+    path: str | Path,
+    analysis: AnalysisResult,
+    geometry: GeometryResult | None = None,
+    *,
+    time_range: tuple[float, float] | None = None,
+    bookmarks: Sequence[Bookmark] | None = None,
+) -> Path:
+    """Write columns as a compressed archive; bookmarks travel in the metadata."""
+
     output = Path(path).expanduser()
     if output.suffix.lower() != ".npz":
         output = output.with_suffix(".npz")
     output.parent.mkdir(parents=True, exist_ok=True)
     names, arrays = _columns(analysis, geometry)
+    mask = _row_mask(analysis.times, time_range)
+    arrays = [values[mask] for values in arrays]
     metadata = {
         "schema": DATA_EXPORT_SCHEMA,
         "schema_version": DATA_EXPORT_VERSION,
@@ -103,6 +159,8 @@ def export_analysis_npz(path: str | Path, analysis: AnalysisResult, geometry: Ge
         "duration": analysis.duration,
         "columns": names,
         "mapping_formulas": dict(geometry.formulas) if geometry is not None else {},
+        "time_range": list(time_range) if time_range is not None else None,
+        "bookmarks": bookmarks_to_payload(bookmarks or ()),
     }
     payload = {f"column_{index:04d}": values for index, values in enumerate(arrays)}
     payload["__metadata__"] = np.asarray(json.dumps(metadata, separators=(",", ":")))

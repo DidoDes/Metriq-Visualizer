@@ -71,6 +71,7 @@ The audio callback performs channel selection, bounded ring-buffer writes, statu
 
 - `metriq_visualizer_cache.py` — content-validated compressed local analysis cache.
 - `metriq_visualizer_atomic.py` — unique same-directory transactional writes.
+- `metriq_visualizer_bookmarks.py` — Qt-free time bookmarks and regions: ordering, duration clamping, session serialization, and CSV/JSON export.
 - `metriq_visualizer_projects.py` — portable `.mvproj` and compatible legacy `.bgl` state.
 - `metriq_visualizer_preset_files.py` — source-free `.mvpreset` state, v1.10 schema translation, user-directory discovery, and display-name precedence.
 - `metriq_visualizer_performance.py` — live-only workload profiles, completed-draw adaptation, and proxy simplification without changing saved/export settings.

@@ -16,7 +16,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 _TEST_SETTINGS_ROOT = Path(tempfile.mkdtemp(prefix="metriq-visualizer-test-settings-"))
 os.environ.setdefault("METRIQ_SETTINGS_PATH", str(_TEST_SETTINGS_ROOT / "settings.ini"))
 
-from PySide6.QtCore import QSettings, QUrl  # noqa: E402
+from PySide6.QtCore import QSettings, Qt, QUrl  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from metriq_visualizer_app import APP_VERSION, MainWindow  # noqa: E402
@@ -395,6 +396,325 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertFalse(window.mute_check.isEnabled())
         self.assertIs(window.analysis_dock.source_panel.stack.currentWidget(), window.analysis_dock.source_panel.video_widget)
         window.close()
+        self.app.processEvents()
+
+    def _bookmark_source(self, name: str) -> Path:
+        source = Path(self.temp.name) / name
+        source.write_text(
+            "time,a,b,c\n"
+            + "\n".join(
+                f"{index / 30:.6f},{np.sin(index / 8):.6f},{np.cos(index / 11):.6f},{index % 17}"
+                for index in range(300)
+            ),
+            encoding="utf-8",
+        )
+        return source
+
+    def test_bookmarks_mark_region_persist_and_ignore_text_fields(self) -> None:
+        source = self._bookmark_source("bookmark-source.csv")
+        window = MainWindow()
+        window.show()
+        window._start_analysis(source)
+        self._wait_for_analysis(window)
+        self.assertTrue(window.bookmark_add_button.isEnabled())
+        self.assertFalse(window.bookmark_export_button.isEnabled())
+
+        window._seek_seconds(2.0)
+        window.toggle_bookmark()
+        self.assertEqual(len(window.bookmarks), 1)
+        self.assertEqual(window.bookmarks[0].start, 2.0)
+        self.assertIsNone(window.bookmarks[0].end)
+        self.assertEqual(window.bookmark_tree.topLevelItemCount(), 1)
+        self.assertEqual(window.bookmark_strip.bookmarks, window.bookmarks)
+
+        # M during playback drops a point; a second M closes it into a region.
+        window._seek_seconds(4.0)
+        window.toggle_playback()
+        window.toggle_bookmark()
+        window.current_time = 5.5
+        window.toggle_bookmark()
+        window.stop_playback()
+        regions = [item for item in window.bookmarks if item.is_region]
+        self.assertEqual(len(regions), 1)
+        self.assertAlmostEqual(regions[0].end, 5.5)
+        self.assertEqual(regions[0].label, "Region 1")
+        self.assertEqual(len(window.bookmarks), 2)
+
+        # The M shortcut works from the workspace...
+        window.play_button.setFocus()
+        self.app.processEvents()
+        window._seek_seconds(8.0)
+        QTest.keyClick(window.play_button, Qt.Key.Key_M)
+        self.app.processEvents()
+        self.assertEqual(len(window.bookmarks), 3)
+        window.bookmark_tree.topLevelItem(2).setSelected(True)
+        window.delete_selected_bookmark()
+        self.assertEqual(len(window.bookmarks), 2)
+        self.assertEqual(window.bookmark_tree.selectedItems(), [])
+
+        # ...but typing M into a formula field edits the text, not the bookmarks.
+        formula = window.x_edit.text()
+        window.x_edit.setFocus()
+        self.app.processEvents()
+        QTest.keyClick(window.x_edit, Qt.Key.Key_M)
+        self.app.processEvents()
+        self.assertEqual(window.x_edit.text(), formula + "m")
+        self.assertEqual(len(window.bookmarks), 2)
+        window.x_edit.setText(formula)
+
+        state = window._capture_state(include_session=True)
+        self.assertEqual(len(state["session"]["bookmarks"]), 2)
+        self.assertNotIn("bookmarks", window._capture_state(include_session=False))
+        window.close()
+        self.app.processEvents()
+
+        restored = MainWindow()
+        restored._start_analysis(source, state=state)
+        self._wait_for_analysis(restored)
+        self.assertEqual(restored.bookmarks, window.bookmarks)
+        self.assertEqual(restored.bookmark_tree.topLevelItemCount(), 2)
+
+        # Opening a different source starts with no bookmarks.
+        restored._start_analysis(self._bookmark_source("bookmark-other.csv"))
+        self._wait_for_analysis(restored)
+        self.assertEqual(restored.bookmarks, [])
+        restored.close()
+        self.app.processEvents()
+
+    def test_play_region_loops_inside_the_selected_region(self) -> None:
+        window = MainWindow()
+        window._start_analysis(self._bookmark_source("bookmark-loop.csv"))
+        self._wait_for_analysis(window)
+        window._seek_seconds(1.0)
+        window.toggle_playback()
+        window.toggle_bookmark()
+        window.current_time = 1.3
+        window.toggle_bookmark()
+        window.stop_playback()
+        window.bookmark_tree.topLevelItem(0).setSelected(True)
+        self.assertTrue(window.bookmark_play_button.isEnabled())
+        window.play_selected_region()
+        self.assertEqual(window._loop_region, (1.0, 1.3))
+        deadline = time.monotonic() + 0.8
+        seen: list[float] = []
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            seen.append(window.current_time)
+            time.sleep(0.005)
+        self.assertTrue(window._playing)
+        self.assertTrue(all(1.0 <= value <= 1.35 for value in seen), (min(seen), max(seen)))
+        window.stop_playback()
+        self.assertIsNone(window._loop_region)
+        window.close()
+        self.app.processEvents()
+
+    def test_dock_drag_marks_region_and_export_studio_offers_it(self) -> None:
+        window = MainWindow()
+        window._start_analysis(self._bookmark_source("bookmark-dock.csv"))
+        self._wait_for_analysis(window)
+        window.analysis_dock.regionDragged.emit(2.0, 3.5)
+        self.assertEqual(len(window.bookmarks), 1)
+        region = window.bookmarks[0]
+        self.assertEqual((region.start, region.end, region.label), (2.0, 3.5, "Region 1"))
+        self.assertEqual(window.analysis_dock.spectrogram.bookmarks, window.bookmarks)
+        self.assertEqual(len(window.analysis_dock.traces._bookmark_artists), 1)
+        self.assertTrue(window.region_data_button.isEnabled())
+
+        window.analysis_dock.seekRequested.emit(6.0)
+        self.assertAlmostEqual(window.current_time, 6.0)
+
+        # A redraw of the panels (new geometry) keeps the bookmark shading.
+        window.rebuild_geometry()
+        self.assertEqual(len(window.analysis_dock.traces._bookmark_artists), 1)
+
+        assert window.analysis is not None and window.geometry is not None
+        studio = ExportStudioDialog(
+            window.analysis,
+            window.geometry,
+            window._make_render_options(width=640, height=360),
+            window,
+            regions=[(region.label, region.start, region.end)],
+        )
+        self.assertEqual(studio.region_combo.count(), 2)
+        studio.region_combo.setCurrentIndex(1)
+        self.assertEqual((studio.start_spin.value(), studio.end_spin.value()), (2.0, 3.5))
+        studio.region_combo.setCurrentIndex(0)
+        self.assertEqual(studio.start_spin.value(), 0.0)
+        self.assertAlmostEqual(studio.end_spin.value(), window.analysis.duration, places=3)
+        studio.close()
+        window.close()
+        self.app.processEvents()
+
+    def _wait_for_compare(self, window: MainWindow, timeout: float = 30.0) -> None:
+        deadline = time.monotonic() + timeout
+        while window.compare_thread is not None and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.app.processEvents()
+        self.assertIsNone(window.compare_thread, "source B analysis did not finish")
+        window._render_preview()
+        self.app.processEvents()
+
+    def _compare_sources(self) -> tuple[Path, Path]:
+        quiet = Path(self.temp.name) / "compare-a.csv"
+        loud = Path(self.temp.name) / "compare-b.csv"
+        quiet.write_text(
+            "time,a,b,c\n"
+            + "\n".join(f"{i / 30:.6f},{np.sin(i / 8):.6f},{np.cos(i / 11):.6f},{i % 17}" for i in range(240)),
+            encoding="utf-8",
+        )
+        loud.write_text(
+            "time,a,b,c\n"
+            + "\n".join(f"{i / 30:.6f},{3 * np.sin(i / 8):.6f},{np.cos(i / 11):.6f},{i % 17}" for i in range(150)),
+            encoding="utf-8",
+        )
+        return quiet, loud
+
+    def test_compare_shows_source_b_with_shared_scale_linked_camera_and_offset(self) -> None:
+        source_a, source_b = self._compare_sources()
+        window = MainWindow()
+        window.resize(1540, 940)
+        window.show()
+        window._start_analysis(source_a)
+        self._wait_for_analysis(window)
+        self.assertEqual(window.compare_button.text(), "Compare")
+        self.assertTrue(window.viewport_b.parentWidget().isHidden())
+        window.x_edit.setText("a")
+        window.rebuild_geometry()
+
+        window.start_compare(source_b)
+        self._wait_for_compare(window)
+        assert window.geometry is not None and window.compare_geometry is not None
+        self.assertFalse(window.viewport_b.parentWidget().isHidden())
+        self.assertIsNotNone(window.viewport_b.scene)
+        self.assertEqual(window.compare_button.text(), "End compare")
+        shared_a = float(np.ptp(window.geometry.x_full))
+        shared_b = float(np.ptp(window.compare_geometry.x_full))
+        self.assertGreater(shared_b, shared_a * 2.0)
+
+        window.compare_shared_check.setChecked(False)
+        window.rebuild_geometry()
+        assert window.geometry is not None and window.compare_geometry is not None
+        self.assertAlmostEqual(
+            float(np.ptp(window.compare_geometry.x_full)), float(np.ptp(window.geometry.x_full)), delta=0.6
+        )
+        window.compare_shared_check.setChecked(True)
+        window.rebuild_geometry()
+        window._render_preview()
+
+        # Dragging either camera moves both.
+        window.viewport.set_camera(12.0, 48.0, 1.3)
+        self.assertEqual(tuple(round(v, 3) for v in window.viewport_b.camera()), (12.0, 48.0, 1.3))
+        window.viewport_b.set_camera(30.0, -20.0, 0.9)
+        self.assertEqual(tuple(round(v, 3) for v in window.viewport.camera()), (30.0, -20.0, 0.9))
+        self.assertAlmostEqual(window.elev_spin.value(), 30.0)
+
+        # B runs on A's clock shifted by the offset and clamped to its own length.
+        window.compare_offset_spin.setValue(1.0)
+        window._seek_seconds(3.0)
+        self.assertAlmostEqual(window._compare_time(), 2.0)
+        window._seek_seconds(0.5)
+        self.assertEqual(window._compare_time(), 0.0)
+        window._seek_seconds(7.5)
+        self.assertAlmostEqual(window._compare_time(), window.compare_analysis.duration)
+
+        window._seek_seconds(0.0)
+        b_frames = 0
+        original_update = window.viewport_b.update_time
+
+        def counted(*args, **kwargs):
+            nonlocal b_frames
+            b_frames += 1
+            return original_update(*args, **kwargs)
+
+        window.viewport_b.update_time = counted  # type: ignore[method-assign]
+        window.toggle_playback()
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        window.stop_playback()
+        self.assertGreaterEqual(b_frames, 2)
+
+        # Every analysis panel stacks B under A on the shared, offset timeline.
+        spectrogram = window.analysis_dock.spectrogram
+        self.assertEqual(len(spectrogram.axes), 2)
+        self.assertEqual(len(spectrogram.cursors), 2)
+        b_extent = spectrogram.axes[1].images[0].get_extent()
+        self.assertAlmostEqual(b_extent[0], 1.0)
+        window.compare_offset_spin.setValue(0.5)
+        self.assertAlmostEqual(window.analysis_dock.spectrogram.axes[1].images[0].get_extent()[0], 0.5)
+        window.compare_offset_spin.setValue(1.0)
+
+        state = window._capture_state(include_session=True)
+        self.assertEqual(state["session"]["compare"]["offset"], 1.0)
+        self.assertEqual(Path(state["session"]["compare"]["file_path"]), source_b.resolve())
+
+        window.toggle_compare()
+        self.assertIsNone(window.compare_path)
+        self.assertTrue(window.viewport_b.parentWidget().isHidden())
+        self.assertEqual(len(window.analysis_dock.spectrogram.axes), 1)
+        self.assertIsNone(window._capture_state(include_session=True)["session"]["compare"])
+        window.close()
+        self.app.processEvents()
+
+        restored = MainWindow()
+        restored._start_analysis(source_a, state=state)
+        self._wait_for_analysis(restored)
+        self._wait_for_compare(restored)
+        self.assertEqual(restored.compare_path, source_b.resolve())
+        self.assertEqual(restored.compare_offset_spin.value(), 1.0)
+        self.assertIsNotNone(restored.compare_geometry)
+        # Opening an unrelated source ends the comparison.
+        restored._start_analysis(self._bookmark_source("compare-other.csv"))
+        self._wait_for_analysis(restored)
+        self.assertIsNone(restored.compare_path)
+        restored.close()
+        self.app.processEvents()
+
+    def test_compare_mapping_shows_one_source_with_two_formula_sets(self) -> None:
+        source_a, _source_b = self._compare_sources()
+        window = MainWindow()
+        window._start_analysis(source_a)
+        self._wait_for_analysis(window)
+        window.x_edit.setText("a")
+        window.rebuild_geometry()
+        window.start_compare_mapping({"x": "b"})
+        self.assertEqual(window.compare_mode, "mapping")
+        self.assertIs(window.compare_analysis, window.analysis)
+        self.assertFalse(window.compare_mapping_box.isHidden())
+        self.assertFalse(window.compare_shared_check.isEnabled())
+        self.assertEqual(window.compare_formula_edits["x"].text(), "b")
+        self.assertEqual(window.compare_formula_edits["y"].text(), window.y_edit.text())
+        assert window.geometry is not None and window.compare_geometry is not None
+        self.assertEqual(window.geometry.formulas["x"], "a")
+        self.assertEqual(window.compare_geometry.formulas["x"], "b")
+        window._render_preview()
+        self.assertIsNotNone(window.viewport_b.scene)
+
+        window.compare_formula_edits["z"].setText("c")
+        window.rebuild_geometry()
+        assert window.compare_geometry is not None
+        self.assertEqual(window.compare_geometry.formulas["z"], "c")
+
+        state = window._capture_state(include_session=True)
+        compare = state["session"]["compare"]
+        self.assertEqual(compare["mode"], "mapping")
+        self.assertEqual(compare["formulas"]["z"], "c")
+        self.assertNotIn("file_path", compare)
+        window.toggle_compare()
+        self.assertEqual(window.compare_mode, "source")
+        self.assertTrue(window.compare_mapping_box.isHidden())
+        window.close()
+        self.app.processEvents()
+
+        restored = MainWindow()
+        restored._start_analysis(source_a, state=state)
+        self._wait_for_analysis(restored)
+        self.assertEqual(restored.compare_mode, "mapping")
+        assert restored.compare_geometry is not None
+        self.assertEqual(restored.compare_geometry.formulas["x"], "b")
+        restored.close()
         self.app.processEvents()
 
     def test_export_format_switch_preserves_video_and_jpeg_quality(self) -> None:

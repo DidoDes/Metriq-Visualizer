@@ -1057,6 +1057,9 @@ class Interactive3DViewport(QWidget):
     """Exact 3D inspection plus a low-latency moving-scene renderer."""
 
     cameraChanged = Signal(float, float, float)
+    # Every camera change, including per-frame autorotation that
+    # ``cameraChanged`` throttles. Used to keep a compare viewport in lockstep.
+    cameraMoved = Signal(float, float, float)
     interactionStarted = Signal()
     frameRendered = Signal(float)
 
@@ -1088,6 +1091,8 @@ class Interactive3DViewport(QWidget):
         self._exact_drag_origin: tuple[float, float] | None = None
         self._exact_drag_camera = (24.0, 35.0)
         self._autorotate_emit_elapsed = 0.0
+        # A follower never rotates on its own; its camera is driven by a leader.
+        self._follower = False
 
         self.stack = QStackedLayout(self)
         self.stack.setContentsMargins(0, 0, 0, 0)
@@ -1178,9 +1183,16 @@ class Interactive3DViewport(QWidget):
             self.stack.setCurrentWidget(self.placeholder)
         self._sync_autorotate_timer()
 
+    def set_follower(self, enabled: bool) -> None:
+        """Make this viewport take its camera from another one instead of autorotating."""
+
+        self._follower = bool(enabled)
+        self._sync_autorotate_timer()
+
     def _sync_autorotate_timer(self) -> None:
         enabled = bool(
-            self.options is not None
+            not self._follower
+            and self.options is not None
             and getattr(self.options, "autorotate", False)
             and (self.scene is not None or self.realtime.live_active)
             and not self._playback_active
@@ -1219,7 +1231,8 @@ class Interactive3DViewport(QWidget):
         """Advance the interactive camera once and report whether it moved."""
 
         if (
-            self.options is None
+            self._follower
+            or self.options is None
             or not bool(getattr(self.options, "autorotate", False))
             or self._realtime_drag_active
             or self._exact_drag_origin is not None
@@ -1364,6 +1377,7 @@ class Interactive3DViewport(QWidget):
         if self.scene is not None:
             self.scene.set_camera(elevation, azimuth, current_zoom, draw=draw and not self._fast_active())
         self.realtime.set_camera(elevation, azimuth, current_zoom, emit=False)
+        self.cameraMoved.emit(elevation, azimuth, current_zoom)
         if emit:
             self.cameraChanged.emit(elevation, azimuth, current_zoom)
 
@@ -1390,6 +1404,7 @@ class Interactive3DViewport(QWidget):
     def _realtime_camera_changed(self, elev: float, azim: float, zoom: float) -> None:
         if self.scene is not None:
             self.scene.set_camera(elev, azim, zoom, draw=False)
+        self.cameraMoved.emit(elev, azim, zoom)
         self.cameraChanged.emit(elev, azim, zoom)
 
     def _button_press(self, event: Any) -> None:
