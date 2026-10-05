@@ -508,6 +508,43 @@ class GuiSmokeTests(unittest.TestCase):
         window.close()
         self.app.processEvents()
 
+    def test_dock_drag_marks_region_and_export_studio_offers_it(self) -> None:
+        window = MainWindow()
+        window._start_analysis(self._bookmark_source("bookmark-dock.csv"))
+        self._wait_for_analysis(window)
+        window.analysis_dock.regionDragged.emit(2.0, 3.5)
+        self.assertEqual(len(window.bookmarks), 1)
+        region = window.bookmarks[0]
+        self.assertEqual((region.start, region.end, region.label), (2.0, 3.5, "Region 1"))
+        self.assertEqual(window.analysis_dock.spectrogram.bookmarks, window.bookmarks)
+        self.assertEqual(len(window.analysis_dock.traces._bookmark_artists), 1)
+        self.assertTrue(window.region_data_button.isEnabled())
+
+        window.analysis_dock.seekRequested.emit(6.0)
+        self.assertAlmostEqual(window.current_time, 6.0)
+
+        # A redraw of the panels (new geometry) keeps the bookmark shading.
+        window.rebuild_geometry()
+        self.assertEqual(len(window.analysis_dock.traces._bookmark_artists), 1)
+
+        assert window.analysis is not None and window.geometry is not None
+        studio = ExportStudioDialog(
+            window.analysis,
+            window.geometry,
+            window._make_render_options(width=640, height=360),
+            window,
+            regions=[(region.label, region.start, region.end)],
+        )
+        self.assertEqual(studio.region_combo.count(), 2)
+        studio.region_combo.setCurrentIndex(1)
+        self.assertEqual((studio.start_spin.value(), studio.end_spin.value()), (2.0, 3.5))
+        studio.region_combo.setCurrentIndex(0)
+        self.assertEqual(studio.start_spin.value(), 0.0)
+        self.assertAlmostEqual(studio.end_spin.value(), window.analysis.duration, places=3)
+        studio.close()
+        window.close()
+        self.app.processEvents()
+
     def test_export_format_switch_preserves_video_and_jpeg_quality(self) -> None:
         source = Path(self.temp.name) / "format-source.csv"
         source.write_text("time,a,b\n0,1,2\n1,2,3\n2,3,5\n", encoding="utf-8")

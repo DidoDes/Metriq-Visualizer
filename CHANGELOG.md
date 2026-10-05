@@ -6,6 +6,9 @@
 
 - Region bookmarks: press M (or Mark in the Data tab) to bookmark the playhead, and press M again during playback to close the mark into a region. A strip above the time slider shows every bookmark; click to jump, double-click to edit its label and note.
 - The Data tab lists bookmarks with edit, delete, looped "Play region", and CSV/JSON export.
+- Analysis panels shade bookmark regions and mark points; click a panel to seek, or shift-drag across it to create a region.
+- "Export region data" writes analyzed and mapped data for the selected region only; full data exports gain a `bookmark` column (CSV) or bookmark metadata (NPZ) when bookmarks exist.
+- Export Studio offers bookmark regions as ready-made time ranges, preselecting the region chosen in the Data tab.
 - Bookmarks are saved in projects and the recoverable session (`state.session.bookmarks`, project schema unchanged) and never in visual presets.
 
 ## 1.12.8 — Windows release validation

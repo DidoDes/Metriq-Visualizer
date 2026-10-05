@@ -938,7 +938,8 @@ class MainWindow(QMainWindow):
         bookmarks_group = QGroupBox("Bookmarks")
         bookmarks_layout = QVBoxLayout(bookmarks_group)
         bookmarks_note = QLabel(
-            "Press M to mark the playhead. Press M again during playback to close the mark into a region."
+            "Press M to mark the playhead. Press M again during playback to close the mark into a region, "
+            "or shift-drag across an analysis panel."
         )
         bookmarks_note.setObjectName("Subtle")
         bookmarks_note.setWordWrap(True)
@@ -968,12 +969,18 @@ class MainWindow(QMainWindow):
             self.bookmark_play_button,
         ):
             bookmark_buttons.addWidget(button)
+        export_buttons = QHBoxLayout()
         self.bookmark_export_button = QPushButton("Export bookmarks")
         self.bookmark_export_button.clicked.connect(self.export_bookmarks_dialog)
+        self.region_data_button = QPushButton("Export region data")
+        self.region_data_button.setToolTip("Export analyzed and mapped data inside the selected region only")
+        self.region_data_button.clicked.connect(self.export_region_data_dialog)
+        export_buttons.addWidget(self.bookmark_export_button)
+        export_buttons.addWidget(self.region_data_button)
         bookmarks_layout.addWidget(bookmarks_note)
         bookmarks_layout.addWidget(self.bookmark_tree)
         bookmarks_layout.addLayout(bookmark_buttons)
-        bookmarks_layout.addWidget(self.bookmark_export_button)
+        bookmarks_layout.addLayout(export_buttons)
         layout.addWidget(bookmarks_group)
 
         reference_group = QGroupBox("Feature reference")
@@ -1027,6 +1034,8 @@ class MainWindow(QMainWindow):
         self.analysis_dock = AnalysisDockWidget(self.workspace_splitter)
         self.analysis_dock.set_media_player(self.media_player)
         self.analysis_dock.collapsedChanged.connect(self._analysis_dock_collapsed_changed)
+        self.analysis_dock.seekRequested.connect(self._seek_seconds)
+        self.analysis_dock.regionDragged.connect(self._dock_region_dragged)
         self.workspace_splitter.addWidget(self.viewport)
         self.workspace_splitter.addWidget(self.analysis_dock)
         self.workspace_splitter.setStretchFactor(0, 1)
@@ -1154,6 +1163,7 @@ class MainWindow(QMainWindow):
         self.bookmarks = []
         self._open_bookmark = None
         self._loop_region = None
+        self._refresh_bookmarks()
         self.analysis = None
         self.geometry = None
         self.current_time = 0.0
@@ -2102,12 +2112,17 @@ class MainWindow(QMainWindow):
             return
         self.stop_playback()
         try:
+            regions = [(item.label, item.start, item.end) for item in self.bookmarks if item.end is not None]
             dialog = ExportStudioDialog(
                 self.analysis,
                 self.geometry,
                 self._make_render_options(width=1920, height=1080),
                 self,
+                regions=regions,
             )
+            selected = self._selected_bookmark()
+            if selected is not None and selected.end is not None:
+                dialog.region_combo.setCurrentIndex(regions.index((selected.label, selected.start, selected.end)) + 1)
             dialog.exec()
             self.current_layout = dialog.layout_spec.clone().clamp()
             self._mark_preview_dirty()
@@ -2362,6 +2377,7 @@ class MainWindow(QMainWindow):
         if self.analysis is not None:
             self.bookmarks = [item.normalized(self._source_duration()) for item in self.bookmarks]
         self.bookmark_strip.set_bookmarks(self.bookmarks, self._source_duration())
+        self.analysis_dock.set_bookmarks(self.bookmarks)
         with QSignalBlocker(self.bookmark_tree):
             self.bookmark_tree.clear()
             for index, item in enumerate(self.bookmarks):
@@ -2414,6 +2430,7 @@ class MainWindow(QMainWindow):
             selected is not None and selected.is_region and self.geometry is not None
         )
         self.bookmark_export_button.setEnabled(bool(self.bookmarks))
+        self.region_data_button.setEnabled(selected is not None and selected.is_region)
 
     def _bookmark_selection_changed(self) -> None:
         selected = self._selected_bookmark()
@@ -2442,6 +2459,13 @@ class MainWindow(QMainWindow):
             self.bookmarks, created = add_bookmark(self.bookmarks, now, duration=duration)
             self._open_bookmark = created if self._playing else None
             self._set_status(f"Bookmarked {created.label} at {self._format_time(created.start)}.")
+        self._refresh_bookmarks(select=created)
+
+    def _dock_region_dragged(self, start: float, end: float) -> None:
+        if self.analysis is None:
+            return
+        self.bookmarks, created = add_bookmark(self.bookmarks, start, end, duration=self._source_duration())
+        self._set_status(f"Bookmarked {created.label} ({created.duration:.2f}s).")
         self._refresh_bookmarks(select=created)
 
     def edit_selected_bookmark(self) -> None:
@@ -2508,6 +2532,37 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             self._show_error("Could not export bookmarks", exc)
 
+    def export_region_data_dialog(self) -> None:
+        selected = self._selected_bookmark()
+        if self.analysis is None or selected is None or selected.end is None:
+            return
+        stem = self.source_path.stem if self.source_path is not None else "metriq_analysis"
+        safe_label = "".join(char if char.isalnum() or char in "-_" else "_" for char in selected.label).strip("_")
+        folder = self.source_path.parent if self.source_path is not None else Path.home()
+        default = folder / f"{stem}_{safe_label or 'region'}.csv"
+        path_text, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            f"Export data for {selected.label}",
+            str(default),
+            "CSV table (*.csv);;Compressed NumPy archive (*.npz)",
+        )
+        if not path_text:
+            return
+        span = (selected.start, selected.end)
+        try:
+            path = Path(path_text)
+            if path.suffix.lower() == ".npz" or "NumPy" in selected_filter:
+                output = export_analysis_npz(
+                    path, self.analysis, self.geometry, time_range=span, bookmarks=self.bookmarks
+                )
+            else:
+                output = export_analysis_csv(
+                    path, self.analysis, self.geometry, time_range=span, bookmarks=self.bookmarks
+                )
+            self._set_status(f"Exported {selected.label} data to {output.name}.")
+        except Exception as exc:  # noqa: BLE001
+            self._show_error("Could not export region data", exc)
+
     def export_data_dialog(self) -> None:
         if self.analysis is None:
             return
@@ -2524,9 +2579,9 @@ class MainWindow(QMainWindow):
         try:
             path = Path(path_text)
             if path.suffix.lower() == ".npz" or "NumPy" in selected_filter:
-                output = export_analysis_npz(path, self.analysis, self.geometry)
+                output = export_analysis_npz(path, self.analysis, self.geometry, bookmarks=self.bookmarks)
             else:
-                output = export_analysis_csv(path, self.analysis, self.geometry)
+                output = export_analysis_csv(path, self.analysis, self.geometry, bookmarks=self.bookmarks)
             self._set_status(f"Exported analysis data to {output.name}.")
         except Exception as exc:  # noqa: BLE001
             self._show_error("Could not export analysis data", exc)

@@ -193,6 +193,13 @@ class BookmarkStrip(QWidget):
 
 
 class AnalysisCanvas(FigureCanvasQTAgg):
+    """One time-aligned scientific panel.
+
+    A click seeks to that time; a shift-drag proposes a bookmark region.
+    """
+
+    seekRequested = Signal(float)
+    regionDragged = Signal(float, float)
     """Compact Matplotlib panel with a synchronized time cursor."""
 
     def __init__(self, mode: str, parent: QWidget | None = None) -> None:
@@ -207,6 +214,14 @@ class AnalysisCanvas(FigureCanvasQTAgg):
         self.cursor: Any = None
         self.axis: Any = None
         self._last_time = -1.0
+        self.bookmarks: list[Bookmark] = []
+        self._bookmark_artists: list[Any] = []
+        self._drag_start: float | None = None
+        self._drag_end: float | None = None
+        self._drag_artist: Any = None
+        self.mpl_connect("button_press_event", self._mouse_pressed)
+        self.mpl_connect("motion_notify_event", self._mouse_moved)
+        self.mpl_connect("button_release_event", self._mouse_released)
         self._build_empty("NO ANALYSIS")
 
     def _style_axis(self, axis: Any) -> None:
@@ -220,6 +235,8 @@ class AnalysisCanvas(FigureCanvasQTAgg):
         axis.grid(False)
 
     def _build_empty(self, message: str) -> None:
+        self._bookmark_artists = []
+        self._drag_artist = None
         self.figure.clear()
         axis = self.figure.add_subplot(111)
         self._style_axis(axis)
@@ -237,6 +254,8 @@ class AnalysisCanvas(FigureCanvasQTAgg):
         if analysis is None:
             self._build_empty("NO ANALYSIS")
             return
+        self._bookmark_artists = []
+        self._drag_artist = None
         self.figure.clear()
         axis = self.figure.add_subplot(111)
         self.axis = axis
@@ -301,6 +320,80 @@ class AnalysisCanvas(FigureCanvasQTAgg):
         self.cursor = axis.axvline(0.0, color=CURSOR, linewidth=1.05, alpha=0.94)
         self.figure.subplots_adjust(left=0.055, right=0.995, bottom=0.23, top=0.94)
         self._last_time = 0.0
+        self._draw_bookmarks()
+        self.draw_idle()
+
+    def set_bookmarks(self, bookmarks: list[Bookmark], *, draw: bool = True) -> None:
+        self.bookmarks = list(bookmarks)
+        self._draw_bookmarks()
+        if draw:
+            self.draw_idle()
+
+    def _draw_bookmarks(self) -> None:
+        for artist in self._bookmark_artists:
+            with suppress(ValueError, AttributeError):
+                artist.remove()
+        self._bookmark_artists = []
+        if self.analysis is None or self.cursor is None or self.axis is None:
+            return
+        for item in self.bookmarks:
+            if item.end is not None:
+                artist = self.axis.axvspan(item.start, item.end, color=item.color, alpha=0.16, linewidth=0, zorder=0.5)
+            else:
+                artist = self.axis.axvline(item.start, color=item.color, linewidth=0.9, linestyle="--", alpha=0.8)
+            self._bookmark_artists.append(artist)
+
+    def _event_time(self, event: Any) -> float | None:
+        if self.analysis is None or self.axis is None or event.inaxes is not self.axis or event.xdata is None:
+            return None
+        return min(max(0.0, float(event.xdata)), max(0.0, float(self.analysis.duration)))
+
+    @staticmethod
+    def _shift_held(event: Any) -> bool:
+        modifiers = getattr(event, "modifiers", None) or ()
+        return "shift" in modifiers or str(getattr(event, "key", "") or "") == "shift"
+
+    def _mouse_pressed(self, event: Any) -> None:
+        seconds = self._event_time(event)
+        if seconds is None or getattr(event, "button", None) != 1:
+            return
+        if self._shift_held(event):
+            self._drag_start = seconds
+            self._update_drag(seconds)
+        else:
+            self.seekRequested.emit(seconds)
+
+    def _mouse_moved(self, event: Any) -> None:
+        if self._drag_start is None:
+            return
+        seconds = self._event_time(event)
+        if seconds is not None:
+            self._update_drag(seconds)
+
+    def _mouse_released(self, event: Any) -> None:
+        if self._drag_start is None:
+            return
+        start = self._drag_start
+        seconds = self._event_time(event)
+        end = seconds if seconds is not None else self._drag_end
+        self._drag_start = None
+        if self._drag_artist is not None:
+            with suppress(ValueError, AttributeError):
+                self._drag_artist.remove()
+            self._drag_artist = None
+            self.draw_idle()
+        if end is not None and abs(end - start) >= 0.01:
+            self.regionDragged.emit(min(start, end), max(start, end))
+
+    def _update_drag(self, seconds: float) -> None:
+        if self._drag_start is None or self.axis is None:
+            return
+        self._drag_end = seconds
+        if self._drag_artist is not None:
+            with suppress(ValueError, AttributeError):
+                self._drag_artist.remove()
+        low, high = sorted((self._drag_start, seconds))
+        self._drag_artist = self.axis.axvspan(low, max(high, low + 1e-6), color=CURSOR, alpha=0.22, linewidth=0)
         self.draw_idle()
 
     def set_time(self, seconds: float, *, draw: bool = True) -> None:
@@ -358,11 +451,16 @@ class SourcePanel(QWidget):
     def set_time(self, seconds: float, *, draw: bool = True) -> None:
         self.waveform.set_time(seconds, draw=draw)
 
+    def set_bookmarks(self, bookmarks: list[Bookmark], *, draw: bool = True) -> None:
+        self.waveform.set_bookmarks(bookmarks, draw=draw)
+
 
 class AnalysisDockWidget(QWidget):
     """A compact, collapsible panel dock placed below the 3D viewport."""
 
     collapsedChanged = Signal(bool)
+    seekRequested = Signal(float)
+    regionDragged = Signal(float, float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -395,6 +493,9 @@ class AnalysisDockWidget(QWidget):
         self.tabs.addTab(self.mfcc, "MFCC")
         self.tabs.addTab(self.traces, "Mapped traces")
         self.tabs.currentChanged.connect(self._tab_changed)
+        for canvas in self._canvases():
+            canvas.seekRequested.connect(self.seekRequested)
+            canvas.regionDragged.connect(self.regionDragged)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -411,6 +512,15 @@ class AnalysisDockWidget(QWidget):
         self.chromagram.set_data(analysis, geometry)
         self.mfcc.set_data(analysis, geometry)
         self.traces.set_data(analysis, geometry)
+
+    def _canvases(self) -> tuple[AnalysisCanvas, ...]:
+        return (self.source_panel.waveform, self.spectrogram, self.chromagram, self.mfcc, self.traces)
+
+    def set_bookmarks(self, bookmarks: list[Bookmark]) -> None:
+        current = self.tabs.currentWidget()
+        for canvas in self._canvases():
+            visible = canvas is current or (current is self.source_panel and canvas is self.source_panel.waveform)
+            canvas.set_bookmarks(bookmarks, draw=visible)
 
     def update_geometry(self, analysis: AnalysisResult | None, geometry: GeometryResult | None) -> None:
         self.traces.set_data(analysis, geometry)
