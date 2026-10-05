@@ -10,18 +10,22 @@ from typing import Any
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import QRectF, Qt, Signal, Slot
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
+    QStyle,
+    QStyleOptionSlider,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from metriq_visualizer_bookmarks import Bookmark, bookmark_at
 from metriq_visualizer_core import AnalysisResult, GeometryResult
 
 try:
@@ -60,6 +64,132 @@ def _normalized(values: np.ndarray) -> np.ndarray:
     if high <= low + 1e-12:
         return np.zeros_like(array)
     return np.clip((np.nan_to_num(array, nan=low) - low) / (high - low), 0.0, 1.0)
+
+
+class BookmarkStrip(QWidget):
+    """Thin timeline lane above the time slider showing bookmarks.
+
+    Regions draw as translucent bars and points as ticks. A click seeks to the
+    bookmark's start (or to the clicked time on empty lane), and a double-click
+    asks the owner to edit the bookmark under the cursor.
+    """
+
+    seekRequested = Signal(float)
+    editRequested = Signal(object)
+
+    HEIGHT = 14
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("BookmarkStrip")
+        self.setFixedHeight(self.HEIGHT)
+        self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.bookmarks: list[Bookmark] = []
+        self.duration = 0.0
+        self.current_time = 0.0
+        self.selected: Bookmark | None = None
+        self._inset = 0.0
+
+    def set_bookmarks(self, bookmarks: list[Bookmark], duration: float) -> None:
+        self.bookmarks = list(bookmarks)
+        self.duration = max(0.0, float(duration))
+        if self.selected is not None and self.selected not in self.bookmarks:
+            self.selected = None
+        self.update()
+
+    def set_selected(self, bookmark: Bookmark | None) -> None:
+        self.selected = bookmark
+        self.update()
+
+    def set_time(self, seconds: float) -> None:
+        self.current_time = max(0.0, float(seconds))
+        self.update()
+
+    def align_to_slider(self, slider: QWidget) -> None:
+        """Match the slider's handle travel so positions line up with it."""
+
+        option = QStyleOptionSlider()
+        option.initFrom(slider)
+        option.orientation = Qt.Orientation.Horizontal
+        handle = slider.style().pixelMetric(QStyle.PixelMetric.PM_SliderLength, option, slider)
+        self._inset = max(0.0, handle / 2.0)
+        self.update()
+
+    def _track(self) -> tuple[float, float]:
+        left = self._inset
+        return left, max(1.0, self.width() - 2.0 * self._inset)
+
+    def x_for_time(self, seconds: float) -> float:
+        left, width = self._track()
+        if self.duration <= 0.0:
+            return left
+        return left + width * min(1.0, max(0.0, seconds / self.duration))
+
+    def time_for_x(self, x: float) -> float:
+        left, width = self._track()
+        return self.duration * min(1.0, max(0.0, (x - left) / width))
+
+    def bookmark_at_x(self, x: float) -> Bookmark | None:
+        if self.duration <= 0.0:
+            return None
+        _left, width = self._track()
+        tolerance = 4.0 / width * self.duration
+        return bookmark_at(self.bookmarks, self.time_for_x(x), tolerance=tolerance)
+
+    def paintEvent(self, _event: QPaintEvent) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        height = float(self.height())
+        left, width = self._track()
+        painter.fillRect(QRectF(left, height / 2.0 - 1.0, width, 2.0), QColor(GRID))
+        if self.duration > 0.0:
+            for item in self.bookmarks:
+                color = QColor(item.color)
+                selected = item == self.selected
+                if item.end is not None:
+                    x0 = self.x_for_time(item.start)
+                    x1 = max(x0 + 2.0, self.x_for_time(item.end))
+                    fill = QColor(color)
+                    fill.setAlpha(150 if selected else 90)
+                    painter.fillRect(QRectF(x0, 2.0, x1 - x0, height - 4.0), fill)
+                    painter.fillRect(QRectF(x0, 1.0, 2.0, height - 2.0), color)
+                else:
+                    x = self.x_for_time(item.start)
+                    painter.setPen(QPen(color, 3.0 if selected else 2.0))
+                    painter.drawLine(int(round(x)), 1, int(round(x)), int(height) - 1)
+            cursor_x = self.x_for_time(self.current_time)
+            painter.setPen(QPen(QColor(CURSOR), 1.0))
+            painter.drawLine(int(round(cursor_x)), 0, int(round(cursor_x)), int(height))
+        painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() != Qt.MouseButton.LeftButton or self.duration <= 0.0:
+            super().mousePressEvent(event)
+            return
+        x = float(event.position().x())
+        item = self.bookmark_at_x(x)
+        self.set_selected(item)
+        self.seekRequested.emit(item.start if item is not None else self.time_for_x(x))
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        item = self.bookmark_at_x(float(event.position().x()))
+        if item is not None:
+            self.editRequested.emit(item)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        item = self.bookmark_at_x(float(event.position().x()))
+        if item is None:
+            self.setToolTip("")
+        else:
+            span = f"{item.start:.2f}s" if item.end is None else f"{item.start:.2f}s – {item.end:.2f}s"
+            note = f"\n{item.note}" if item.note else ""
+            self.setToolTip(f"{item.label} · {span}{note}")
+        super().mouseMoveEvent(event)
 
 
 class AnalysisCanvas(FigureCanvasQTAgg):
@@ -335,4 +465,4 @@ class AnalysisDockWidget(QWidget):
         return int(max(190, self._expanded_height))
 
 
-__all__ = ["AnalysisCanvas", "AnalysisDockWidget", "SourcePanel"]
+__all__ = ["AnalysisCanvas", "AnalysisDockWidget", "BookmarkStrip", "SourcePanel"]

@@ -32,6 +32,7 @@ REQUIRED_FILES = (
 IMPORTS = (
     "metriq_visualizer_atomic",
     "metriq_visualizer_3d",
+    "metriq_visualizer_bookmarks",
     "metriq_visualizer_core",
     "metriq_visualizer_layout",
     "metriq_visualizer_render",

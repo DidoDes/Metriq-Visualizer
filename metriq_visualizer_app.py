@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -48,11 +50,21 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTabWidget,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from metriq_visualizer_3d import Interactive3DViewport, ViewportCommandStrip
+from metriq_visualizer_bookmarks import (
+    Bookmark,
+    add_bookmark,
+    bookmarks_from_payload,
+    bookmarks_to_payload,
+    close_region,
+    export_bookmarks,
+)
 from metriq_visualizer_cache import analyze_source_cached, cache_directory, clear_cache
 from metriq_visualizer_core import (
     DEFAULT_PRESETS,
@@ -66,7 +78,7 @@ from metriq_visualizer_data_export import export_analysis_csv, export_analysis_n
 from metriq_visualizer_export_studio import ExportStudioDialog
 from metriq_visualizer_layout import ExportLayoutSpec, balanced_export_layout
 from metriq_visualizer_live import LiveInputPanel
-from metriq_visualizer_panels import AnalysisDockWidget
+from metriq_visualizer_panels import AnalysisDockWidget, BookmarkStrip
 from metriq_visualizer_performance import (
     DEFAULT_PERFORMANCE_PROFILE,
     PERFORMANCE_PROFILES,
@@ -223,6 +235,31 @@ class UpdateInstallWorker(QObject):
             self.failed.emit(details[-8000:])
 
 
+class BookmarkEditDialog(QDialog):
+    """Small editor for a bookmark's label and note."""
+
+    def __init__(self, bookmark: Bookmark, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit bookmark")
+        layout = QFormLayout(self)
+        span = MainWindow._format_time(bookmark.start)
+        if bookmark.end is not None:
+            span += f" – {MainWindow._format_time(bookmark.end)}"
+        layout.addRow("Time", QLabel(span))
+        self.label_edit = QLineEdit(bookmark.label)
+        self.note_edit = QPlainTextEdit(bookmark.note)
+        self.note_edit.setMinimumHeight(80)
+        layout.addRow("Label", self.label_edit)
+        layout.addRow("Note", self.note_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def values(self) -> tuple[str, str]:
+        return self.label_edit.text().strip(), self.note_edit.toPlainText().strip()
+
+
 class MainWindow(QMainWindow):
     """Responsive desktop interface around Metriq's existing local renderer."""
 
@@ -262,6 +299,11 @@ class MainWindow(QMainWindow):
         self.project_path: Path | None = None
         self.current_layout: ExportLayoutSpec = balanced_export_layout()
         self.current_time = 0.0
+        self.bookmarks: list[Bookmark] = []
+        # A point dropped with M during playback; a second M closes it into a region.
+        self._open_bookmark: Bookmark | None = None
+        # (start, end) seconds while "Play region" loops one bookmark.
+        self._loop_region: tuple[float, float] | None = None
 
         self.analysis_thread: QThread | None = None
         self.analysis_worker: AnalysisWorker | None = None
@@ -893,6 +935,47 @@ class MainWindow(QMainWindow):
         tools_layout.addWidget(self.cache_path_label)
         layout.addWidget(tools_group)
 
+        bookmarks_group = QGroupBox("Bookmarks")
+        bookmarks_layout = QVBoxLayout(bookmarks_group)
+        bookmarks_note = QLabel(
+            "Press M to mark the playhead. Press M again during playback to close the mark into a region."
+        )
+        bookmarks_note.setObjectName("Subtle")
+        bookmarks_note.setWordWrap(True)
+        self.bookmark_tree = QTreeWidget()
+        self.bookmark_tree.setColumnCount(3)
+        self.bookmark_tree.setHeaderLabels(["Time", "Length", "Label"])
+        self.bookmark_tree.setRootIsDecorated(False)
+        self.bookmark_tree.setUniformRowHeights(True)
+        self.bookmark_tree.setMinimumHeight(120)
+        self.bookmark_tree.itemSelectionChanged.connect(self._bookmark_selection_changed)
+        self.bookmark_tree.itemDoubleClicked.connect(lambda *_args: self.edit_selected_bookmark())
+        bookmark_buttons = QHBoxLayout()
+        self.bookmark_add_button = QPushButton("Mark")
+        self.bookmark_add_button.setToolTip("Add a bookmark at the playhead (M)")
+        self.bookmark_add_button.clicked.connect(self.toggle_bookmark)
+        self.bookmark_edit_button = QPushButton("Edit")
+        self.bookmark_edit_button.clicked.connect(self.edit_selected_bookmark)
+        self.bookmark_delete_button = QPushButton("Delete")
+        self.bookmark_delete_button.clicked.connect(self.delete_selected_bookmark)
+        self.bookmark_play_button = QPushButton("Play region")
+        self.bookmark_play_button.setToolTip("Loop playback over the selected region")
+        self.bookmark_play_button.clicked.connect(self.play_selected_region)
+        for button in (
+            self.bookmark_add_button,
+            self.bookmark_edit_button,
+            self.bookmark_delete_button,
+            self.bookmark_play_button,
+        ):
+            bookmark_buttons.addWidget(button)
+        self.bookmark_export_button = QPushButton("Export bookmarks")
+        self.bookmark_export_button.clicked.connect(self.export_bookmarks_dialog)
+        bookmarks_layout.addWidget(bookmarks_note)
+        bookmarks_layout.addWidget(self.bookmark_tree)
+        bookmarks_layout.addLayout(bookmark_buttons)
+        bookmarks_layout.addWidget(self.bookmark_export_button)
+        layout.addWidget(bookmarks_group)
+
         reference_group = QGroupBox("Feature reference")
         reference_layout = QVBoxLayout(reference_group)
         self.info_box = QTextEdit()
@@ -978,9 +1061,18 @@ class MainWindow(QMainWindow):
         self.volume_slider.valueChanged.connect(self._volume_changed)
         self.mute_check = QCheckBox("Mute")
         self.mute_check.toggled.connect(self._mute_toggled)
+        self.bookmark_strip = BookmarkStrip()
+        self.bookmark_strip.align_to_slider(self.time_slider)
+        self.bookmark_strip.seekRequested.connect(self._bookmark_strip_seek)
+        self.bookmark_strip.editRequested.connect(self.edit_bookmark)
+        slider_column = QVBoxLayout()
+        slider_column.setContentsMargins(0, 0, 0, 0)
+        slider_column.setSpacing(0)
+        slider_column.addWidget(self.bookmark_strip)
+        slider_column.addWidget(self.time_slider)
         timeline.addWidget(self.play_button)
         timeline.addWidget(self.time_label)
-        timeline.addWidget(self.time_slider, 1)
+        timeline.addLayout(slider_column, 1)
         timeline.addWidget(self.loop_check)
         timeline.addWidget(self.volume_label)
         timeline.addWidget(self.volume_slider)
@@ -988,7 +1080,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(timeline)
 
         hint = QLabel(
-            "Drag in the 3D field to orbit · scroll to zoom · Space play/pause · Ctrl+E Export Studio · "
+            "Drag in the 3D field to orbit · scroll to zoom · Space play/pause · M bookmark · Ctrl+E Export Studio · "
             "analysis panels remain docked below the original visualizer workflow."
         )
         hint.setObjectName("Subtle")
@@ -1007,6 +1099,7 @@ class MainWindow(QMainWindow):
             ("Ctrl+L", self.open_live_input),
             ("F5", self.rebuild_geometry),
             ("Space", self.toggle_playback),
+            ("M", self.toggle_bookmark),
         )
         self._shortcuts: list[QShortcut] = []
         for sequence, callback in shortcuts:
@@ -1058,6 +1151,9 @@ class MainWindow(QMainWindow):
         self.source_path = path.resolve()
         if state is None:
             self.project_path = None
+        self.bookmarks = []
+        self._open_bookmark = None
+        self._loop_region = None
         self.analysis = None
         self.geometry = None
         self.current_time = 0.0
@@ -1108,6 +1204,7 @@ class MainWindow(QMainWindow):
                     self.preset_combo.setCurrentIndex(index)
                 self._apply_preset("Table / PCA explorer", rebuild=False)
         self.info_box.setPlainText(format_feature_reference(result))
+        self._refresh_bookmarks()
         self._update_data_summary()
         self.rebuild_geometry()
         if self.pending_seek is not None:
@@ -1789,6 +1886,8 @@ class MainWindow(QMainWindow):
     def stop_playback(self) -> None:
         was_playing = self._playing
         self._playing = False
+        self._loop_region = None
+        self._open_bookmark = None
         if hasattr(self, "viewport"):
             self.viewport.set_playback_active(False)
         self.preview_session_dirty = True
@@ -1853,6 +1952,13 @@ class MainWindow(QMainWindow):
                     self._media_last_position_ms = max(self._media_last_position_ms, position_ms)
                 elapsed = self.play_clock.restart() / 1000.0
                 target = self.current_time + max(0.0, elapsed)
+        if self._loop_region is not None and target >= self._loop_region[1]:
+            target = self._loop_region[0]
+            if self._media_source_path is not None and not self._media_failed:
+                position_ms = round(target * 1000.0)
+                self.media_player.setPosition(position_ms)
+                self._media_last_position_ms = position_ms
+                self._media_stall_clock.restart()
         if target >= duration:
             if self.loop_check.isChecked() and duration > 0:
                 target %= duration
@@ -1980,6 +2086,8 @@ class MainWindow(QMainWindow):
     def _update_time_label(self) -> None:
         duration = float(getattr(self.analysis, "duration", 0.0)) if self.analysis is not None else 0.0
         self.time_label.setText(f"{self._format_time(self.current_time)} / {self._format_time(duration)}")
+        if hasattr(self, "bookmark_strip"):
+            self.bookmark_strip.set_time(self.current_time)
 
     @staticmethod
     def _format_time(seconds: float) -> str:
@@ -2244,6 +2352,162 @@ class MainWindow(QMainWindow):
         if not visible and self.live_input_panel is not None and self.live_input_panel.engine.active:
             self.live_input_panel.stop_input()
 
+    # ------------------------------------------------------------ Bookmarks
+    def _source_duration(self) -> float:
+        return float(max(0.0, self.analysis.duration)) if self.analysis is not None else 0.0
+
+    def _refresh_bookmarks(self, select: Bookmark | None = None) -> None:
+        """Redraw the strip and list from ``self.bookmarks``, selecting *select*."""
+
+        if self.analysis is not None:
+            self.bookmarks = [item.normalized(self._source_duration()) for item in self.bookmarks]
+        self.bookmark_strip.set_bookmarks(self.bookmarks, self._source_duration())
+        with QSignalBlocker(self.bookmark_tree):
+            self.bookmark_tree.clear()
+            for index, item in enumerate(self.bookmarks):
+                length = "" if item.end is None else f"{item.duration:.2f}s"
+                row = QTreeWidgetItem([self._format_time(item.start), length, item.label])
+                row.setData(0, Qt.ItemDataRole.UserRole, index)
+                row.setToolTip(2, item.note or item.label)
+                self.bookmark_tree.addTopLevelItem(row)
+                if select is not None and item == select:
+                    row.setSelected(True)
+                    self.bookmark_tree.setCurrentItem(row)
+            for column in range(2):
+                self.bookmark_tree.resizeColumnToContents(column)
+        self.bookmark_strip.set_selected(self._selected_bookmark())
+        self._update_bookmark_buttons()
+
+    def _selected_bookmark(self) -> Bookmark | None:
+        if not hasattr(self, "bookmark_tree"):
+            return None
+        items = self.bookmark_tree.selectedItems()
+        if not items:
+            return None
+        index = items[0].data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(index, int) and 0 <= index < len(self.bookmarks):
+            return self.bookmarks[index]
+        return None
+
+    def _select_bookmark(self, bookmark: Bookmark | None) -> None:
+        with QSignalBlocker(self.bookmark_tree):
+            self.bookmark_tree.clearSelection()
+            for row_index in range(self.bookmark_tree.topLevelItemCount()):
+                row = self.bookmark_tree.topLevelItem(row_index)
+                index = row.data(0, Qt.ItemDataRole.UserRole)
+                if bookmark is not None and isinstance(index, int) and self.bookmarks[index] == bookmark:
+                    row.setSelected(True)
+                    self.bookmark_tree.setCurrentItem(row)
+                    break
+        self.bookmark_strip.set_selected(bookmark)
+        self._update_bookmark_buttons()
+
+    def _update_bookmark_buttons(self) -> None:
+        if not hasattr(self, "bookmark_tree"):
+            return
+        selected = self._selected_bookmark()
+        has_source = self.analysis is not None
+        self.bookmark_add_button.setEnabled(has_source)
+        self.bookmark_edit_button.setEnabled(selected is not None)
+        self.bookmark_delete_button.setEnabled(selected is not None)
+        self.bookmark_play_button.setEnabled(
+            selected is not None and selected.is_region and self.geometry is not None
+        )
+        self.bookmark_export_button.setEnabled(bool(self.bookmarks))
+
+    def _bookmark_selection_changed(self) -> None:
+        selected = self._selected_bookmark()
+        self.bookmark_strip.set_selected(selected)
+        self._update_bookmark_buttons()
+        if selected is not None and not self._playing:
+            self._seek_seconds(selected.start)
+
+    def _bookmark_strip_seek(self, seconds: float) -> None:
+        self._select_bookmark(self.bookmark_strip.selected)
+        self._seek_seconds(seconds)
+
+    def toggle_bookmark(self) -> None:
+        """Drop a mark at the playhead, or close the open mark into a region."""
+
+        if self.analysis is None:
+            return
+        duration = self._source_duration()
+        now = self.current_time
+        open_mark = self._open_bookmark
+        if self._playing and open_mark is not None and open_mark in self.bookmarks and now > open_mark.start:
+            self.bookmarks, created = close_region(self.bookmarks, open_mark, now, duration=duration)
+            self._open_bookmark = None
+            self._set_status(f"Bookmarked {created.label} ({created.duration:.2f}s).")
+        else:
+            self.bookmarks, created = add_bookmark(self.bookmarks, now, duration=duration)
+            self._open_bookmark = created if self._playing else None
+            self._set_status(f"Bookmarked {created.label} at {self._format_time(created.start)}.")
+        self._refresh_bookmarks(select=created)
+
+    def edit_selected_bookmark(self) -> None:
+        selected = self._selected_bookmark()
+        if selected is not None:
+            self.edit_bookmark(selected)
+
+    def edit_bookmark(self, bookmark: object) -> None:
+        if not isinstance(bookmark, Bookmark) or bookmark not in self.bookmarks:
+            return
+        dialog = BookmarkEditDialog(bookmark, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        label, note = dialog.values()
+        updated = Bookmark(
+            start=bookmark.start,
+            end=bookmark.end,
+            label=label or bookmark.label,
+            note=note,
+            color=bookmark.color,
+        ).normalized(self._source_duration())
+        self.bookmarks[self.bookmarks.index(bookmark)] = updated
+        if self._open_bookmark == bookmark:
+            self._open_bookmark = updated
+        self._refresh_bookmarks(select=updated)
+
+    def delete_selected_bookmark(self) -> None:
+        selected = self._selected_bookmark()
+        if selected is None:
+            return
+        self.bookmarks.remove(selected)
+        if self._open_bookmark == selected:
+            self._open_bookmark = None
+        self._refresh_bookmarks()
+
+    def play_selected_region(self) -> None:
+        selected = self._selected_bookmark()
+        if selected is None or selected.end is None or self.geometry is None:
+            return
+        if self._playing:
+            self.stop_playback()
+        self._seek_seconds(selected.start)
+        self.toggle_playback()
+        if self._playing:
+            self._loop_region = (selected.start, selected.end)
+            self._set_status(f"Looping {selected.label}. Pause to stop.")
+
+    def export_bookmarks_dialog(self) -> None:
+        if not self.bookmarks:
+            return
+        stem = self.source_path.stem if self.source_path is not None else "metriq"
+        default = (self.source_path.parent if self.source_path is not None else Path.home()) / f"{stem}_bookmarks.csv"
+        path_text, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export bookmarks",
+            str(default),
+            "CSV table (*.csv);;JSON (*.json)",
+        )
+        if not path_text:
+            return
+        try:
+            output = export_bookmarks(path_text, self.bookmarks, source_path=self.source_path)
+            self._set_status(f"Exported {len(self.bookmarks)} bookmarks to {output.name}.")
+        except Exception as exc:  # noqa: BLE001
+            self._show_error("Could not export bookmarks", exc)
+
     def export_data_dialog(self) -> None:
         if self.analysis is None:
             return
@@ -2415,6 +2679,7 @@ class MainWindow(QMainWindow):
                 "file_path": str(self.source_path) if self.source_path else "",
                 "current_time": self.current_time,
                 "theme": self.theme_name,
+                "bookmarks": bookmarks_to_payload(self.bookmarks),
             }
         return state
 
@@ -2539,6 +2804,11 @@ class MainWindow(QMainWindow):
             session = state.get("session") if isinstance(state.get("session"), Mapping) else {}
             if "current_time" in session:
                 self.pending_seek = _safe_float(session.get("current_time"), 0.0)
+            if "bookmarks" in session:
+                duration = float(self.analysis.duration) if self.analysis is not None else None
+                self.bookmarks = bookmarks_from_payload(session.get("bookmarks"), duration)
+                self._open_bookmark = None
+                self._refresh_bookmarks()
             theme = str(session.get("theme", "")).strip().lower()
             if theme in {"dark", "light"}:
                 self._set_theme(theme)
@@ -2685,6 +2955,7 @@ class MainWindow(QMainWindow):
         self.play_button.setEnabled(bool(ready and duration > 0.0))
         self._set_audio_controls_enabled(self._media_source_path is not None and self._media_has_audio)
         self.save_preset_button.setEnabled(True)
+        self._update_bookmark_buttons()
         self._update_reanalyze_state()
         if ready and self.source_path is not None:
             self.source_badge.setText(f"LOCAL / {self.source_path.name.upper()}")

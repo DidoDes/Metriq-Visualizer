@@ -16,7 +16,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 _TEST_SETTINGS_ROOT = Path(tempfile.mkdtemp(prefix="metriq-visualizer-test-settings-"))
 os.environ.setdefault("METRIQ_SETTINGS_PATH", str(_TEST_SETTINGS_ROOT / "settings.ini"))
 
-from PySide6.QtCore import QSettings, QUrl  # noqa: E402
+from PySide6.QtCore import QSettings, Qt, QUrl  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from metriq_visualizer_app import APP_VERSION, MainWindow  # noqa: E402
@@ -394,6 +395,116 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertFalse(window.volume_slider.isEnabled())
         self.assertFalse(window.mute_check.isEnabled())
         self.assertIs(window.analysis_dock.source_panel.stack.currentWidget(), window.analysis_dock.source_panel.video_widget)
+        window.close()
+        self.app.processEvents()
+
+    def _bookmark_source(self, name: str) -> Path:
+        source = Path(self.temp.name) / name
+        source.write_text(
+            "time,a,b,c\n"
+            + "\n".join(
+                f"{index / 30:.6f},{np.sin(index / 8):.6f},{np.cos(index / 11):.6f},{index % 17}"
+                for index in range(300)
+            ),
+            encoding="utf-8",
+        )
+        return source
+
+    def test_bookmarks_mark_region_persist_and_ignore_text_fields(self) -> None:
+        source = self._bookmark_source("bookmark-source.csv")
+        window = MainWindow()
+        window.show()
+        window._start_analysis(source)
+        self._wait_for_analysis(window)
+        self.assertTrue(window.bookmark_add_button.isEnabled())
+        self.assertFalse(window.bookmark_export_button.isEnabled())
+
+        window._seek_seconds(2.0)
+        window.toggle_bookmark()
+        self.assertEqual(len(window.bookmarks), 1)
+        self.assertEqual(window.bookmarks[0].start, 2.0)
+        self.assertIsNone(window.bookmarks[0].end)
+        self.assertEqual(window.bookmark_tree.topLevelItemCount(), 1)
+        self.assertEqual(window.bookmark_strip.bookmarks, window.bookmarks)
+
+        # M during playback drops a point; a second M closes it into a region.
+        window._seek_seconds(4.0)
+        window.toggle_playback()
+        window.toggle_bookmark()
+        window.current_time = 5.5
+        window.toggle_bookmark()
+        window.stop_playback()
+        regions = [item for item in window.bookmarks if item.is_region]
+        self.assertEqual(len(regions), 1)
+        self.assertAlmostEqual(regions[0].end, 5.5)
+        self.assertEqual(regions[0].label, "Region 1")
+        self.assertEqual(len(window.bookmarks), 2)
+
+        # The M shortcut works from the workspace...
+        window.play_button.setFocus()
+        self.app.processEvents()
+        window._seek_seconds(8.0)
+        QTest.keyClick(window.play_button, Qt.Key.Key_M)
+        self.app.processEvents()
+        self.assertEqual(len(window.bookmarks), 3)
+        window.bookmark_tree.topLevelItem(2).setSelected(True)
+        window.delete_selected_bookmark()
+        self.assertEqual(len(window.bookmarks), 2)
+        self.assertEqual(window.bookmark_tree.selectedItems(), [])
+
+        # ...but typing M into a formula field edits the text, not the bookmarks.
+        formula = window.x_edit.text()
+        window.x_edit.setFocus()
+        self.app.processEvents()
+        QTest.keyClick(window.x_edit, Qt.Key.Key_M)
+        self.app.processEvents()
+        self.assertEqual(window.x_edit.text(), formula + "m")
+        self.assertEqual(len(window.bookmarks), 2)
+        window.x_edit.setText(formula)
+
+        state = window._capture_state(include_session=True)
+        self.assertEqual(len(state["session"]["bookmarks"]), 2)
+        self.assertNotIn("bookmarks", window._capture_state(include_session=False))
+        window.close()
+        self.app.processEvents()
+
+        restored = MainWindow()
+        restored._start_analysis(source, state=state)
+        self._wait_for_analysis(restored)
+        self.assertEqual(restored.bookmarks, window.bookmarks)
+        self.assertEqual(restored.bookmark_tree.topLevelItemCount(), 2)
+
+        # Opening a different source starts with no bookmarks.
+        restored._start_analysis(self._bookmark_source("bookmark-other.csv"))
+        self._wait_for_analysis(restored)
+        self.assertEqual(restored.bookmarks, [])
+        restored.close()
+        self.app.processEvents()
+
+    def test_play_region_loops_inside_the_selected_region(self) -> None:
+        window = MainWindow()
+        window._start_analysis(self._bookmark_source("bookmark-loop.csv"))
+        self._wait_for_analysis(window)
+        window._seek_seconds(1.0)
+        window.toggle_playback()
+        window.toggle_bookmark()
+        window.current_time = 1.3
+        window.toggle_bookmark()
+        window.stop_playback()
+        window.bookmark_tree.topLevelItem(0).setSelected(True)
+        self.assertTrue(window.bookmark_play_button.isEnabled())
+        window.play_selected_region()
+        self.assertEqual(window._loop_region, (1.0, 1.3))
+        deadline = time.monotonic() + 0.8
+        seen: list[float] = []
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            seen.append(window.current_time)
+            time.sleep(0.005)
+        self.assertTrue(window._playing)
+        self.assertTrue(all(1.0 <= value <= 1.35 for value in seen), (min(seen), max(seen)))
+        window.stop_playback()
+        self.assertIsNone(window._loop_region)
         window.close()
         self.app.processEvents()
 
