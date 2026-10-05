@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -48,11 +50,21 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTabWidget,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from metriq_visualizer_3d import Interactive3DViewport, ViewportCommandStrip
+from metriq_visualizer_bookmarks import (
+    Bookmark,
+    add_bookmark,
+    bookmarks_from_payload,
+    bookmarks_to_payload,
+    close_region,
+    export_bookmarks,
+)
 from metriq_visualizer_cache import analyze_source_cached, cache_directory, clear_cache
 from metriq_visualizer_core import (
     DEFAULT_PRESETS,
@@ -61,12 +73,13 @@ from metriq_visualizer_core import (
     GeometryResult,
     build_geometry,
     format_feature_reference,
+    geometry_reference,
 )
 from metriq_visualizer_data_export import export_analysis_csv, export_analysis_npz
 from metriq_visualizer_export_studio import ExportStudioDialog
 from metriq_visualizer_layout import ExportLayoutSpec, balanced_export_layout
 from metriq_visualizer_live import LiveInputPanel
-from metriq_visualizer_panels import AnalysisDockWidget
+from metriq_visualizer_panels import AnalysisDockWidget, BookmarkStrip
 from metriq_visualizer_performance import (
     DEFAULT_PERFORMANCE_PROFILE,
     PERFORMANCE_PROFILES,
@@ -223,6 +236,31 @@ class UpdateInstallWorker(QObject):
             self.failed.emit(details[-8000:])
 
 
+class BookmarkEditDialog(QDialog):
+    """Small editor for a bookmark's label and note."""
+
+    def __init__(self, bookmark: Bookmark, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit bookmark")
+        layout = QFormLayout(self)
+        span = MainWindow._format_time(bookmark.start)
+        if bookmark.end is not None:
+            span += f" – {MainWindow._format_time(bookmark.end)}"
+        layout.addRow("Time", QLabel(span))
+        self.label_edit = QLineEdit(bookmark.label)
+        self.note_edit = QPlainTextEdit(bookmark.note)
+        self.note_edit.setMinimumHeight(80)
+        layout.addRow("Label", self.label_edit)
+        layout.addRow("Note", self.note_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def values(self) -> tuple[str, str]:
+        return self.label_edit.text().strip(), self.note_edit.toPlainText().strip()
+
+
 class MainWindow(QMainWindow):
     """Responsive desktop interface around Metriq's existing local renderer."""
 
@@ -262,6 +300,23 @@ class MainWindow(QMainWindow):
         self.project_path: Path | None = None
         self.current_layout: ExportLayoutSpec = balanced_export_layout()
         self.current_time = 0.0
+        self.bookmarks: list[Bookmark] = []
+        # A point dropped with M during playback; a second M closes it into a region.
+        self._open_bookmark: Bookmark | None = None
+        # (start, end) seconds while "Play region" loops one bookmark.
+        self._loop_region: tuple[float, float] | None = None
+        # A/B compare: source B is analyzed with the same settings, mapped with
+        # the same formulas, and shown beside A on A's timeline shifted by
+        # ``compare_offset`` seconds (B time = A time - offset).
+        self.compare_path: Path | None = None
+        self.compare_analysis: AnalysisResult | None = None
+        self.compare_geometry: GeometryResult | None = None
+        self.compare_thread: QThread | None = None
+        self.compare_worker: AnalysisWorker | None = None
+        self.pending_compare: dict[str, Any] | None = None
+        # "source": B is a second file. "mapping": B is source A with its own formulas.
+        self.compare_mode = "source"
+        self._linking_cameras = False
 
         self.analysis_thread: QThread | None = None
         self.analysis_worker: AnalysisWorker | None = None
@@ -875,6 +930,50 @@ class MainWindow(QMainWindow):
         summary_layout.addRow("Visible points", self.summary_points)
         layout.addWidget(summary_group)
 
+        compare_group = QGroupBox("A/B compare")
+        compare_layout = QFormLayout(compare_group)
+        self.compare_source_label = QLabel("Off")
+        self.compare_source_label.setWordWrap(True)
+        self.compare_offset_spin = QDoubleSpinBox()
+        self.compare_offset_spin.setRange(-3600.0, 3600.0)
+        self.compare_offset_spin.setDecimals(3)
+        self.compare_offset_spin.setSingleStep(0.1)
+        self.compare_offset_spin.setSuffix(" s")
+        self.compare_offset_spin.setToolTip("B starts this many seconds after A on the shared timeline")
+        self.compare_offset_spin.valueChanged.connect(self._compare_offset_changed)
+        self.compare_shared_check = QCheckBox("Scale A and B together")
+        self.compare_shared_check.setChecked(True)
+        self.compare_shared_check.setToolTip(
+            "On: both sources share one scale, so a louder or wider source looks larger. "
+            "Off: each source fills the space on its own."
+        )
+        self.compare_shared_check.toggled.connect(self._queue_geometry_rebuild)
+        self.compare_button = QPushButton("Compare")
+        self.compare_button.setToolTip("Show a second source beside this one (Ctrl+B)")
+        self.compare_button.clicked.connect(self.toggle_compare)
+        self.compare_mapping_button = QPushButton("Compare mapping")
+        self.compare_mapping_button.setToolTip("Show this source again with a second set of formulas")
+        self.compare_mapping_button.clicked.connect(lambda: self.start_compare_mapping())
+        compare_buttons = QHBoxLayout()
+        compare_buttons.addWidget(self.compare_button)
+        compare_buttons.addWidget(self.compare_mapping_button)
+        self.compare_mapping_box = QWidget()
+        mapping_form = QFormLayout(self.compare_mapping_box)
+        mapping_form.setContentsMargins(0, 0, 0, 0)
+        self.compare_formula_edits: dict[str, QLineEdit] = {}
+        for key, title in (("x", "B · X"), ("y", "B · Y"), ("z", "B · Z"), ("color", "B · Color"), ("size", "B · Size")):
+            edit = QLineEdit()
+            edit.textChanged.connect(self._queue_geometry_rebuild)
+            self.compare_formula_edits[key] = edit
+            mapping_form.addRow(title, edit)
+        self.compare_mapping_box.setVisible(False)
+        compare_layout.addRow("Source B", self.compare_source_label)
+        compare_layout.addRow("", compare_buttons)
+        compare_layout.addRow(self.compare_mapping_box)
+        compare_layout.addRow("B offset", self.compare_offset_spin)
+        compare_layout.addRow("", self.compare_shared_check)
+        layout.addWidget(compare_group)
+
         tools_group = QGroupBox("Analysis portability")
         tools_layout = QVBoxLayout(tools_group)
         export_note = QLabel("Export every analyzed feature plus the current mapped geometry to CSV or compressed NPZ.")
@@ -892,6 +991,54 @@ class MainWindow(QMainWindow):
         tools_layout.addWidget(self.clear_cache_button)
         tools_layout.addWidget(self.cache_path_label)
         layout.addWidget(tools_group)
+
+        bookmarks_group = QGroupBox("Bookmarks")
+        bookmarks_layout = QVBoxLayout(bookmarks_group)
+        bookmarks_note = QLabel(
+            "Press M to mark the playhead. Press M again during playback to close the mark into a region, "
+            "or shift-drag across an analysis panel."
+        )
+        bookmarks_note.setObjectName("Subtle")
+        bookmarks_note.setWordWrap(True)
+        self.bookmark_tree = QTreeWidget()
+        self.bookmark_tree.setColumnCount(3)
+        self.bookmark_tree.setHeaderLabels(["Time", "Length", "Label"])
+        self.bookmark_tree.setRootIsDecorated(False)
+        self.bookmark_tree.setUniformRowHeights(True)
+        self.bookmark_tree.setMinimumHeight(120)
+        self.bookmark_tree.itemSelectionChanged.connect(self._bookmark_selection_changed)
+        self.bookmark_tree.itemDoubleClicked.connect(lambda *_args: self.edit_selected_bookmark())
+        bookmark_buttons = QHBoxLayout()
+        self.bookmark_add_button = QPushButton("Mark")
+        self.bookmark_add_button.setToolTip("Add a bookmark at the playhead (M)")
+        self.bookmark_add_button.clicked.connect(self.toggle_bookmark)
+        self.bookmark_edit_button = QPushButton("Edit")
+        self.bookmark_edit_button.clicked.connect(self.edit_selected_bookmark)
+        self.bookmark_delete_button = QPushButton("Delete")
+        self.bookmark_delete_button.clicked.connect(self.delete_selected_bookmark)
+        self.bookmark_play_button = QPushButton("Play region")
+        self.bookmark_play_button.setToolTip("Loop playback over the selected region")
+        self.bookmark_play_button.clicked.connect(self.play_selected_region)
+        for button in (
+            self.bookmark_add_button,
+            self.bookmark_edit_button,
+            self.bookmark_delete_button,
+            self.bookmark_play_button,
+        ):
+            bookmark_buttons.addWidget(button)
+        export_buttons = QHBoxLayout()
+        self.bookmark_export_button = QPushButton("Export bookmarks")
+        self.bookmark_export_button.clicked.connect(self.export_bookmarks_dialog)
+        self.region_data_button = QPushButton("Export region data")
+        self.region_data_button.setToolTip("Export analyzed and mapped data inside the selected region only")
+        self.region_data_button.clicked.connect(self.export_region_data_dialog)
+        export_buttons.addWidget(self.bookmark_export_button)
+        export_buttons.addWidget(self.region_data_button)
+        bookmarks_layout.addWidget(bookmarks_note)
+        bookmarks_layout.addWidget(self.bookmark_tree)
+        bookmarks_layout.addLayout(bookmark_buttons)
+        bookmarks_layout.addLayout(export_buttons)
+        layout.addWidget(bookmarks_group)
 
         reference_group = QGroupBox("Feature reference")
         reference_layout = QVBoxLayout(reference_group)
@@ -934,7 +1081,27 @@ class MainWindow(QMainWindow):
         # panels are a subordinate bottom dock, never a replacement for 3D.
         self.workspace_splitter = QSplitter(Qt.Orientation.Vertical, frame)
         self.workspace_splitter.setChildrenCollapsible(False)
-        self.viewport = Interactive3DViewport(self.workspace_splitter)
+        self.viewport_splitter = QSplitter(Qt.Orientation.Horizontal, self.workspace_splitter)
+        self.viewport_splitter.setChildrenCollapsible(False)
+        self.viewport = Interactive3DViewport()
+        self.viewport_b = Interactive3DViewport()
+        self.viewport_b.set_follower(True)
+        self.viewport_b.placeholder.setText("SOURCE B\n\nUse Compare to choose a second source.")
+        self.viewport_a_caption = QLabel("A")
+        self.viewport_b_caption = QLabel("B")
+        for caption, view in ((self.viewport_a_caption, self.viewport), (self.viewport_b_caption, self.viewport_b)):
+            caption.setObjectName("Eyebrow")
+            caption.setVisible(False)
+            column = QWidget()
+            column_layout = QVBoxLayout(column)
+            column_layout.setContentsMargins(0, 0, 0, 0)
+            column_layout.setSpacing(2)
+            column_layout.addWidget(caption)
+            column_layout.addWidget(view, 1)
+            self.viewport_splitter.addWidget(column)
+        self.viewport_b.parentWidget().setVisible(False)
+        self.viewport.cameraMoved.connect(self._camera_moved_a)
+        self.viewport_b.cameraMoved.connect(self._camera_moved_b)
         self.viewport.cameraChanged.connect(self._viewport_camera_changed)
         self.viewport.interactionStarted.connect(self._viewport_interaction_started)
         self.viewport.frameRendered.connect(self._preview_frame_rendered)
@@ -944,7 +1111,9 @@ class MainWindow(QMainWindow):
         self.analysis_dock = AnalysisDockWidget(self.workspace_splitter)
         self.analysis_dock.set_media_player(self.media_player)
         self.analysis_dock.collapsedChanged.connect(self._analysis_dock_collapsed_changed)
-        self.workspace_splitter.addWidget(self.viewport)
+        self.analysis_dock.seekRequested.connect(self._seek_seconds)
+        self.analysis_dock.regionDragged.connect(self._dock_region_dragged)
+        self.workspace_splitter.addWidget(self.viewport_splitter)
         self.workspace_splitter.addWidget(self.analysis_dock)
         self.workspace_splitter.setStretchFactor(0, 1)
         self.workspace_splitter.setStretchFactor(1, 0)
@@ -978,9 +1147,18 @@ class MainWindow(QMainWindow):
         self.volume_slider.valueChanged.connect(self._volume_changed)
         self.mute_check = QCheckBox("Mute")
         self.mute_check.toggled.connect(self._mute_toggled)
+        self.bookmark_strip = BookmarkStrip()
+        self.bookmark_strip.align_to_slider(self.time_slider)
+        self.bookmark_strip.seekRequested.connect(self._bookmark_strip_seek)
+        self.bookmark_strip.editRequested.connect(self.edit_bookmark)
+        slider_column = QVBoxLayout()
+        slider_column.setContentsMargins(0, 0, 0, 0)
+        slider_column.setSpacing(0)
+        slider_column.addWidget(self.bookmark_strip)
+        slider_column.addWidget(self.time_slider)
         timeline.addWidget(self.play_button)
         timeline.addWidget(self.time_label)
-        timeline.addWidget(self.time_slider, 1)
+        timeline.addLayout(slider_column, 1)
         timeline.addWidget(self.loop_check)
         timeline.addWidget(self.volume_label)
         timeline.addWidget(self.volume_slider)
@@ -988,7 +1166,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(timeline)
 
         hint = QLabel(
-            "Drag in the 3D field to orbit · scroll to zoom · Space play/pause · Ctrl+E Export Studio · "
+            "Drag in the 3D field to orbit · scroll to zoom · Space play/pause · M bookmark · Ctrl+B compare · "
+            "Ctrl+E Export Studio · "
             "analysis panels remain docked below the original visualizer workflow."
         )
         hint.setObjectName("Subtle")
@@ -1007,6 +1186,8 @@ class MainWindow(QMainWindow):
             ("Ctrl+L", self.open_live_input),
             ("F5", self.rebuild_geometry),
             ("Space", self.toggle_playback),
+            ("M", self.toggle_bookmark),
+            ("Ctrl+B", self.toggle_compare),
         )
         self._shortcuts: list[QShortcut] = []
         for sequence, callback in shortcuts:
@@ -1058,6 +1239,13 @@ class MainWindow(QMainWindow):
         self.source_path = path.resolve()
         if state is None:
             self.project_path = None
+        self.bookmarks = []
+        self._open_bookmark = None
+        self._loop_region = None
+        self._refresh_bookmarks()
+        self.pending_compare = None
+        # Any running B analysis is discarded: its result belongs to the old A.
+        self._end_compare(rebuild=False)
         self.analysis = None
         self.geometry = None
         self.current_time = 0.0
@@ -1108,12 +1296,14 @@ class MainWindow(QMainWindow):
                     self.preset_combo.setCurrentIndex(index)
                 self._apply_preset("Table / PCA explorer", rebuild=False)
         self.info_box.setPlainText(format_feature_reference(result))
+        self._refresh_bookmarks()
         self._update_data_summary()
         self.rebuild_geometry()
         if self.pending_seek is not None:
             self._seek_seconds(self.pending_seek)
             self.pending_seek = None
         self._remember_recent(self.source_path)
+        self._start_pending_compare()
         cache_note = " from analysis cache" if bool(result.metadata.get("cache_hit")) else ""
         self._set_status(f"Loaded {self.source_path.name}{cache_note}.")
         self._update_reanalyze_state()
@@ -1391,19 +1581,34 @@ class MainWindow(QMainWindow):
         self._set_status("Building geometry…")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            self.geometry = build_geometry(
-                self.analysis,
-                self.x_edit.text().strip() or "pc1",
-                self.y_edit.text().strip() or "pc2",
-                self.z_edit.text().strip() or "pc3",
-                self.color_edit.text().strip() or "time",
-                self.size_edit.text().strip() or "rms",
-                normalize_mode=str(self.normalize_combo.currentData() or "zscore"),
-                max_points=int(self.max_points_spin.value()),
-                low_volume_cutoff_db=float(self.cutoff_spin.value()),
-                colormap=self.colormap_combo.currentText(),
-            )
+            formulas = self._mapping_formulas()
+            normalize_mode = str(self.normalize_combo.currentData() or "zscore")
+            cutoff = float(self.cutoff_spin.value())
+            reference = None
+            if (
+                self.compare_analysis is not None
+                and self.compare_mode == "source"
+                and self.compare_shared_check.isChecked()
+            ):
+                try:
+                    reference = geometry_reference(
+                        [self.analysis, self.compare_analysis],
+                        *formulas,
+                        normalize_mode=normalize_mode,
+                        low_volume_cutoff_db=cutoff,
+                    )
+                except Exception:  # noqa: BLE001 - B is reported below; A keeps its own scale
+                    reference = None
+            geometry_options = {
+                "normalize_mode": normalize_mode,
+                "max_points": int(self.max_points_spin.value()),
+                "low_volume_cutoff_db": cutoff,
+                "colormap": self.colormap_combo.currentText(),
+            }
+            self.geometry = build_geometry(self.analysis, *formulas, reference=reference, **geometry_options)
+            self._rebuild_compare_geometry(formulas, reference, geometry_options)
             self._update_data_summary()
+            self._sync_dock_compare()
             self.analysis_dock.update_geometry(self.analysis, self.geometry)
             self._set_ready_state(True)
             self._mark_preview_dirty()
@@ -1644,6 +1849,9 @@ class MainWindow(QMainWindow):
             self.viewport.set_motion_mode(live_proxy)
             self.viewport.set_motion_frame_interval(max(16, round(1000 / max(1, int(self.live_fps_spin.value())))))
             effective_budget = self._effective_live_point_budget()
+            if self._compare_ready():
+                # Two scenes share the live point budget so playback cost stays flat.
+                effective_budget = max(100, effective_budget // 2)
             self.viewport.set_live_point_budget(effective_budget)
             options = self._make_render_options(
                 width=max(640, self.viewport.width()),
@@ -1664,6 +1872,7 @@ class MainWindow(QMainWindow):
                 # high-DPI canvases and can nearly double Matplotlib work.
                 self.viewport.update_options(options, draw=False)
             self.preview_session = self.viewport.scene
+            exact_b = self._render_compare_preview(options, ratio_cap, live_proxy, effective_budget, needs_exact_draw)
             self.preview_session_dirty = False
             # A paused exact scene is static until the user changes an option,
             # camera, or timeline position. Forcing Matplotlib to redraw it
@@ -1675,6 +1884,8 @@ class MainWindow(QMainWindow):
                 if live_proxy or needs_exact_draw
                 else False
             )
+            if self._compare_ready() and (live_proxy or exact_b):
+                self.viewport_b.update_time(self._compare_time(), draw=True)
             # The scientific panels are Matplotlib canvases.  Updating their
             # cursor on every 3D playback frame can starve the realtime
             # renderer, especially with a visible spectrogram.  Keep the
@@ -1771,6 +1982,7 @@ class MainWindow(QMainWindow):
         self._last_preview_draw_ms = 0.0
         self._playing = True
         self.viewport.set_playback_active(True)
+        self.viewport_b.set_playback_active(True)
         self.preview_session_dirty = True
         self._using_media_clock = bool(self._media_source_path is not None and not self._media_failed)
         self.play_clock.restart()
@@ -1789,8 +2001,11 @@ class MainWindow(QMainWindow):
     def stop_playback(self) -> None:
         was_playing = self._playing
         self._playing = False
+        self._loop_region = None
+        self._open_bookmark = None
         if hasattr(self, "viewport"):
             self.viewport.set_playback_active(False)
+            self.viewport_b.set_playback_active(False)
         self.preview_session_dirty = True
         self.play_timer.stop()
         self.playback_render_timer.stop()
@@ -1853,6 +2068,13 @@ class MainWindow(QMainWindow):
                     self._media_last_position_ms = max(self._media_last_position_ms, position_ms)
                 elapsed = self.play_clock.restart() / 1000.0
                 target = self.current_time + max(0.0, elapsed)
+        if self._loop_region is not None and target >= self._loop_region[1]:
+            target = self._loop_region[0]
+            if self._media_source_path is not None and not self._media_failed:
+                position_ms = round(target * 1000.0)
+                self.media_player.setPosition(position_ms)
+                self._media_last_position_ms = position_ms
+                self._media_stall_clock.restart()
         if target >= duration:
             if self.loop_check.isChecked() and duration > 0:
                 target %= duration
@@ -1980,6 +2202,8 @@ class MainWindow(QMainWindow):
     def _update_time_label(self) -> None:
         duration = float(getattr(self.analysis, "duration", 0.0)) if self.analysis is not None else 0.0
         self.time_label.setText(f"{self._format_time(self.current_time)} / {self._format_time(duration)}")
+        if hasattr(self, "bookmark_strip"):
+            self.bookmark_strip.set_time(self.current_time)
 
     @staticmethod
     def _format_time(seconds: float) -> str:
@@ -1994,12 +2218,17 @@ class MainWindow(QMainWindow):
             return
         self.stop_playback()
         try:
+            regions = [(item.label, item.start, item.end) for item in self.bookmarks if item.end is not None]
             dialog = ExportStudioDialog(
                 self.analysis,
                 self.geometry,
                 self._make_render_options(width=1920, height=1080),
                 self,
+                regions=regions,
             )
+            selected = self._selected_bookmark()
+            if selected is not None and selected.end is not None:
+                dialog.region_combo.setCurrentIndex(regions.index((selected.label, selected.start, selected.end)) + 1)
             dialog.exec()
             self.current_layout = dialog.layout_spec.clone().clamp()
             self._mark_preview_dirty()
@@ -2244,6 +2473,484 @@ class MainWindow(QMainWindow):
         if not visible and self.live_input_panel is not None and self.live_input_panel.engine.active:
             self.live_input_panel.stop_input()
 
+    # ------------------------------------------------------------ A/B compare
+    def _mapping_formulas(self) -> tuple[str, str, str, str, str]:
+        return (
+            self.x_edit.text().strip() or "pc1",
+            self.y_edit.text().strip() or "pc2",
+            self.z_edit.text().strip() or "pc3",
+            self.color_edit.text().strip() or "time",
+            self.size_edit.text().strip() or "rms",
+        )
+
+    def _compare_ready(self) -> bool:
+        return self.compare_analysis is not None and self.compare_geometry is not None
+
+    def _compare_time(self) -> float:
+        if self.compare_analysis is None:
+            return 0.0
+        seconds = self.current_time - float(self.compare_offset_spin.value())
+        return min(max(0.0, seconds), float(max(0.0, self.compare_analysis.duration)))
+
+    def _compare_formulas(self) -> tuple[str, str, str, str, str]:
+        defaults = self._mapping_formulas()
+        keys = ("x", "y", "z", "color", "size")
+        return tuple(  # type: ignore[return-value]
+            self.compare_formula_edits[key].text().strip() or default for key, default in zip(keys, defaults, strict=True)
+        )
+
+    def _compare_state(self) -> dict[str, Any] | None:
+        if self.compare_path is None:
+            return None
+        state: dict[str, Any] = {
+            "mode": self.compare_mode,
+            "offset": float(self.compare_offset_spin.value()),
+            "shared_scale": bool(self.compare_shared_check.isChecked()),
+        }
+        if self.compare_mode == "mapping":
+            state["formulas"] = dict(zip(("x", "y", "z", "color", "size"), self._compare_formulas(), strict=True))
+        else:
+            state["file_path"] = str(self.compare_path)
+        return state
+
+    def start_compare_mapping(self, formulas: Mapping[str, Any] | None = None, *, offset: float | None = None) -> None:
+        """Show source A twice: as mapped now, and with a second set of formulas."""
+
+        if self.analysis is None or self.source_path is None or self.compare_thread is not None:
+            return
+        self.stop_playback()
+        self._end_compare(rebuild=False)
+        current = dict(zip(("x", "y", "z", "color", "size"), self._mapping_formulas(), strict=True))
+        for key, edit in self.compare_formula_edits.items():
+            value = formulas.get(key) if isinstance(formulas, Mapping) else None
+            with QSignalBlocker(edit):
+                edit.setText(str(value).strip() if value else current[key])
+        with QSignalBlocker(self.compare_offset_spin):
+            self.compare_offset_spin.setValue(float(offset or 0.0))
+        self.compare_mode = "mapping"
+        self.compare_path = self.source_path
+        self.compare_analysis = self.analysis
+        self.compare_mapping_box.setVisible(True)
+        self.compare_shared_check.setEnabled(False)
+        self.compare_source_label.setText(f"{self.source_path.name} · second mapping")
+        self._set_compare_visible(True)
+        self.rebuild_geometry()
+        self._set_status("Comparing two mappings of the same source. Edit B's formulas in the Data tab.")
+
+    def toggle_compare(self) -> None:
+        if self.compare_path is not None or self.compare_thread is not None:
+            if self.compare_thread is None:
+                self._end_compare()
+            return
+        if self.analysis is None:
+            return
+        folder = self.source_path.parent if self.source_path is not None else Path.home()
+        path_text, _ = QFileDialog.getOpenFileName(self, "Choose source B", str(folder), SUPPORTED_FILES)
+        if path_text:
+            self.start_compare(Path(path_text))
+
+    def start_compare(self, path: Path, *, offset: float | None = None, shared_scale: bool | None = None) -> None:
+        """Analyze *path* as source B with A's extraction settings."""
+
+        if self.analysis is None or self.compare_thread is not None:
+            return
+        if not path.exists():
+            QMessageBox.warning(self, "Source B not found", f"The source file does not exist:\n{path}")
+            return
+        self.stop_playback()
+        self._end_compare(rebuild=False)
+        if offset is not None:
+            with QSignalBlocker(self.compare_offset_spin):
+                self.compare_offset_spin.setValue(float(offset))
+        if shared_scale is not None:
+            with QSignalBlocker(self.compare_shared_check):
+                self.compare_shared_check.setChecked(bool(shared_scale))
+        self.compare_path = path.resolve()
+        self._set_compare_visible(True)
+        self.viewport_b.clear_scene(f"ANALYZING SOURCE B\n\n{path.name}")
+        self.compare_source_label.setText(f"Analyzing {path.name}…")
+        self.compare_button.setEnabled(False)
+        self._set_status(f"Analyzing source B: {path.name}…")
+        self.compare_worker = AnalysisWorker(self.compare_path, self.analysis_settings)
+        self.compare_thread = QThread(self)
+        self.compare_worker.moveToThread(self.compare_thread)
+        self.compare_thread.started.connect(self.compare_worker.run)
+        self.compare_worker.finished.connect(self._compare_finished)
+        self.compare_worker.failed.connect(self._compare_failed)
+        self.compare_worker.finished.connect(self.compare_thread.quit)
+        self.compare_worker.failed.connect(self.compare_thread.quit)
+        self.compare_thread.finished.connect(self._compare_thread_finished)
+        self.compare_thread.start()
+
+    def _start_pending_compare(self) -> None:
+        state = self.pending_compare
+        self.pending_compare = None
+        if not state:
+            return
+        if str(state.get("mode", "source")) == "mapping":
+            formulas = state.get("formulas")
+            self.start_compare_mapping(
+                formulas if isinstance(formulas, Mapping) else None,
+                offset=_safe_float(state.get("offset"), 0.0),
+            )
+            return
+        path_text = str(state.get("file_path", "")).strip()
+        if not path_text or not Path(path_text).expanduser().exists():
+            if path_text:
+                self._set_status(f"Source B is missing: {path_text}")
+            return
+        self.start_compare(
+            Path(path_text).expanduser(),
+            offset=_safe_float(state.get("offset"), 0.0),
+            shared_scale=bool(state.get("shared_scale", True)),
+        )
+
+    @Slot(object)
+    def _compare_finished(self, result: AnalysisResult) -> None:
+        if self.compare_path is None:
+            return
+        self.compare_analysis = result
+        self.compare_source_label.setText(
+            f"{self.compare_path.name} · {float(result.duration):.2f} s · {str(result.source_kind).title()}"
+        )
+        self.viewport_b_caption.setText(f"B / {self.compare_path.name.upper()}")
+        self.rebuild_geometry()
+        self._set_status(f"Comparing with {self.compare_path.name}.")
+
+    @Slot(str)
+    def _compare_failed(self, details: str) -> None:
+        name = self.compare_path.name if self.compare_path is not None else "source B"
+        self._end_compare(rebuild=False)
+        QMessageBox.critical(self, f"Could not analyze {name}", details)
+
+    @Slot()
+    def _compare_thread_finished(self) -> None:
+        for item in (self.compare_worker, self.compare_thread):
+            if item is not None:
+                item.deleteLater()
+        self.compare_thread = None
+        self.compare_worker = None
+        self.compare_button.setEnabled(self.analysis is not None)
+        self._update_compare_button()
+
+    def _rebuild_compare_geometry(self, formulas: tuple[str, ...], reference: Any, options: Mapping[str, Any]) -> None:
+        if self.compare_analysis is None:
+            self.compare_geometry = None
+            return
+        if self.compare_mode == "mapping":
+            formulas = self._compare_formulas()
+        try:
+            self.compare_geometry = build_geometry(self.compare_analysis, *formulas, reference=reference, **options)
+        except Exception as exc:  # noqa: BLE001
+            self.compare_geometry = None
+            self.viewport_b.clear_scene(f"SOURCE B CANNOT USE THIS MAPPING\n\n{exc}")
+
+    def _end_compare(self, *, rebuild: bool = True) -> None:
+        had_compare = self.compare_path is not None
+        self.compare_mode = "source"
+        self.compare_mapping_box.setVisible(False)
+        self.compare_shared_check.setEnabled(True)
+        self.compare_path = None
+        self.compare_analysis = None
+        self.compare_geometry = None
+        self.viewport_b.clear_scene("SOURCE B\n\nUse Compare to choose a second source.")
+        self.compare_source_label.setText("Off")
+        self._sync_dock_compare()
+        self._set_compare_visible(False)
+        self._update_compare_button()
+        if had_compare and rebuild and self.analysis is not None:
+            # A returns to its own scale once B is gone.
+            self.rebuild_geometry()
+
+    def _set_compare_visible(self, visible: bool) -> None:
+        self.viewport_b.parentWidget().setVisible(visible)
+        self.viewport_a_caption.setVisible(visible)
+        self.viewport_b_caption.setVisible(visible)
+        # Two side-by-side scenes need a narrower minimum than one.
+        minimum = 300 if visible else 580
+        self.viewport.setMinimumWidth(minimum)
+        self.viewport_b.setMinimumWidth(minimum)
+        if visible:
+            name = self.source_path.name.upper() if self.source_path is not None else "SOURCE"
+            if self.compare_mode == "mapping":
+                self.viewport_a_caption.setText(f"A / {name} / CURRENT MAPPING")
+                self.viewport_b_caption.setText(f"B / {name} / SECOND MAPPING")
+            else:
+                self.viewport_a_caption.setText(f"A / {name}")
+                if self.compare_path is not None:
+                    self.viewport_b_caption.setText(f"B / {self.compare_path.name.upper()}")
+            half = max(1, self.viewport_splitter.width() // 2)
+            self.viewport_splitter.setSizes([half, half])
+        self._mark_preview_dirty()
+
+    def _update_compare_button(self) -> None:
+        active = self.compare_path is not None
+        self.compare_button.setText("End compare" if active else "Compare")
+        self.compare_button.setEnabled(self.compare_thread is None and (active or self.analysis is not None))
+        self.compare_mapping_button.setEnabled(self.compare_thread is None and not active and self.analysis is not None)
+
+    def _compare_offset_changed(self, _value: float) -> None:
+        self._sync_dock_compare()
+        self._mark_preview_dirty()
+
+    def _sync_dock_compare(self) -> None:
+        self.analysis_dock.set_compare(
+            self.compare_analysis,
+            self.compare_geometry,
+            float(self.compare_offset_spin.value()),
+        )
+
+    def _render_compare_preview(
+        self,
+        options: Any,
+        ratio_cap: float | None,
+        live_proxy: bool,
+        budget: int,
+        exact_a: bool,
+    ) -> bool:
+        """Keep viewport B's scene current; return True when B needs an exact draw."""
+
+        if not self._compare_ready():
+            return False
+        assert self.compare_analysis is not None and self.compare_geometry is not None
+        view = self.viewport_b
+        view.set_render_pixel_ratio_cap(ratio_cap)
+        view.set_motion_mode(live_proxy)
+        view.set_motion_frame_interval(max(16, round(1000 / max(1, int(self.live_fps_spin.value())))))
+        view.set_live_point_budget(budget)
+        changed = (
+            view.scene is None
+            or view.geometry is not self.compare_geometry
+            or view.analysis is not self.compare_analysis
+        )
+        if changed:
+            view.set_scene(self.compare_analysis, self.compare_geometry, options)
+            self._sync_compare_camera()
+        elif self.preview_session_dirty:
+            view.update_options(options, draw=False)
+            self._sync_compare_camera()
+        return bool(changed or exact_a)
+
+    def _sync_compare_camera(self) -> None:
+        self._camera_moved_a(*self.viewport.camera())
+
+    @Slot(float, float, float)
+    def _camera_moved_a(self, elev: float, azim: float, zoom: float) -> None:
+        if self._linking_cameras or not self._compare_ready():
+            return
+        self._linking_cameras = True
+        try:
+            self.viewport_b.set_camera(elev, azim, zoom, draw=not self._playing, emit=False)
+        finally:
+            self._linking_cameras = False
+
+    @Slot(float, float, float)
+    def _camera_moved_b(self, elev: float, azim: float, zoom: float) -> None:
+        if self._linking_cameras:
+            return
+        self._linking_cameras = True
+        try:
+            # Emitting from A keeps the inspector's camera fields in step.
+            self.viewport.set_camera(elev, azim, zoom, draw=not self._playing, emit=True)
+        finally:
+            self._linking_cameras = False
+
+    # ------------------------------------------------------------ Bookmarks
+    def _source_duration(self) -> float:
+        return float(max(0.0, self.analysis.duration)) if self.analysis is not None else 0.0
+
+    def _refresh_bookmarks(self, select: Bookmark | None = None) -> None:
+        """Redraw the strip and list from ``self.bookmarks``, selecting *select*."""
+
+        if self.analysis is not None:
+            self.bookmarks = [item.normalized(self._source_duration()) for item in self.bookmarks]
+        self.bookmark_strip.set_bookmarks(self.bookmarks, self._source_duration())
+        self.analysis_dock.set_bookmarks(self.bookmarks)
+        with QSignalBlocker(self.bookmark_tree):
+            self.bookmark_tree.clear()
+            for index, item in enumerate(self.bookmarks):
+                length = "" if item.end is None else f"{item.duration:.2f}s"
+                row = QTreeWidgetItem([self._format_time(item.start), length, item.label])
+                row.setData(0, Qt.ItemDataRole.UserRole, index)
+                row.setToolTip(2, item.note or item.label)
+                self.bookmark_tree.addTopLevelItem(row)
+                if select is not None and item == select:
+                    row.setSelected(True)
+                    self.bookmark_tree.setCurrentItem(row)
+            for column in range(2):
+                self.bookmark_tree.resizeColumnToContents(column)
+        self.bookmark_strip.set_selected(self._selected_bookmark())
+        self._update_bookmark_buttons()
+
+    def _selected_bookmark(self) -> Bookmark | None:
+        if not hasattr(self, "bookmark_tree"):
+            return None
+        items = self.bookmark_tree.selectedItems()
+        if not items:
+            return None
+        index = items[0].data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(index, int) and 0 <= index < len(self.bookmarks):
+            return self.bookmarks[index]
+        return None
+
+    def _select_bookmark(self, bookmark: Bookmark | None) -> None:
+        with QSignalBlocker(self.bookmark_tree):
+            self.bookmark_tree.clearSelection()
+            for row_index in range(self.bookmark_tree.topLevelItemCount()):
+                row = self.bookmark_tree.topLevelItem(row_index)
+                index = row.data(0, Qt.ItemDataRole.UserRole)
+                if bookmark is not None and isinstance(index, int) and self.bookmarks[index] == bookmark:
+                    row.setSelected(True)
+                    self.bookmark_tree.setCurrentItem(row)
+                    break
+        self.bookmark_strip.set_selected(bookmark)
+        self._update_bookmark_buttons()
+
+    def _update_bookmark_buttons(self) -> None:
+        if not hasattr(self, "bookmark_tree"):
+            return
+        selected = self._selected_bookmark()
+        has_source = self.analysis is not None
+        self.bookmark_add_button.setEnabled(has_source)
+        self.bookmark_edit_button.setEnabled(selected is not None)
+        self.bookmark_delete_button.setEnabled(selected is not None)
+        self.bookmark_play_button.setEnabled(
+            selected is not None and selected.is_region and self.geometry is not None
+        )
+        self.bookmark_export_button.setEnabled(bool(self.bookmarks))
+        self.region_data_button.setEnabled(selected is not None and selected.is_region)
+
+    def _bookmark_selection_changed(self) -> None:
+        selected = self._selected_bookmark()
+        self.bookmark_strip.set_selected(selected)
+        self._update_bookmark_buttons()
+        if selected is not None and not self._playing:
+            self._seek_seconds(selected.start)
+
+    def _bookmark_strip_seek(self, seconds: float) -> None:
+        self._select_bookmark(self.bookmark_strip.selected)
+        self._seek_seconds(seconds)
+
+    def toggle_bookmark(self) -> None:
+        """Drop a mark at the playhead, or close the open mark into a region."""
+
+        if self.analysis is None:
+            return
+        duration = self._source_duration()
+        now = self.current_time
+        open_mark = self._open_bookmark
+        if self._playing and open_mark is not None and open_mark in self.bookmarks and now > open_mark.start:
+            self.bookmarks, created = close_region(self.bookmarks, open_mark, now, duration=duration)
+            self._open_bookmark = None
+            self._set_status(f"Bookmarked {created.label} ({created.duration:.2f}s).")
+        else:
+            self.bookmarks, created = add_bookmark(self.bookmarks, now, duration=duration)
+            self._open_bookmark = created if self._playing else None
+            self._set_status(f"Bookmarked {created.label} at {self._format_time(created.start)}.")
+        self._refresh_bookmarks(select=created)
+
+    def _dock_region_dragged(self, start: float, end: float) -> None:
+        if self.analysis is None:
+            return
+        self.bookmarks, created = add_bookmark(self.bookmarks, start, end, duration=self._source_duration())
+        self._set_status(f"Bookmarked {created.label} ({created.duration:.2f}s).")
+        self._refresh_bookmarks(select=created)
+
+    def edit_selected_bookmark(self) -> None:
+        selected = self._selected_bookmark()
+        if selected is not None:
+            self.edit_bookmark(selected)
+
+    def edit_bookmark(self, bookmark: object) -> None:
+        if not isinstance(bookmark, Bookmark) or bookmark not in self.bookmarks:
+            return
+        dialog = BookmarkEditDialog(bookmark, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        label, note = dialog.values()
+        updated = Bookmark(
+            start=bookmark.start,
+            end=bookmark.end,
+            label=label or bookmark.label,
+            note=note,
+            color=bookmark.color,
+        ).normalized(self._source_duration())
+        self.bookmarks[self.bookmarks.index(bookmark)] = updated
+        if self._open_bookmark == bookmark:
+            self._open_bookmark = updated
+        self._refresh_bookmarks(select=updated)
+
+    def delete_selected_bookmark(self) -> None:
+        selected = self._selected_bookmark()
+        if selected is None:
+            return
+        self.bookmarks.remove(selected)
+        if self._open_bookmark == selected:
+            self._open_bookmark = None
+        self._refresh_bookmarks()
+
+    def play_selected_region(self) -> None:
+        selected = self._selected_bookmark()
+        if selected is None or selected.end is None or self.geometry is None:
+            return
+        if self._playing:
+            self.stop_playback()
+        self._seek_seconds(selected.start)
+        self.toggle_playback()
+        if self._playing:
+            self._loop_region = (selected.start, selected.end)
+            self._set_status(f"Looping {selected.label}. Pause to stop.")
+
+    def export_bookmarks_dialog(self) -> None:
+        if not self.bookmarks:
+            return
+        stem = self.source_path.stem if self.source_path is not None else "metriq"
+        default = (self.source_path.parent if self.source_path is not None else Path.home()) / f"{stem}_bookmarks.csv"
+        path_text, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export bookmarks",
+            str(default),
+            "CSV table (*.csv);;JSON (*.json)",
+        )
+        if not path_text:
+            return
+        try:
+            output = export_bookmarks(path_text, self.bookmarks, source_path=self.source_path)
+            self._set_status(f"Exported {len(self.bookmarks)} bookmarks to {output.name}.")
+        except Exception as exc:  # noqa: BLE001
+            self._show_error("Could not export bookmarks", exc)
+
+    def export_region_data_dialog(self) -> None:
+        selected = self._selected_bookmark()
+        if self.analysis is None or selected is None or selected.end is None:
+            return
+        stem = self.source_path.stem if self.source_path is not None else "metriq_analysis"
+        safe_label = "".join(char if char.isalnum() or char in "-_" else "_" for char in selected.label).strip("_")
+        folder = self.source_path.parent if self.source_path is not None else Path.home()
+        default = folder / f"{stem}_{safe_label or 'region'}.csv"
+        path_text, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            f"Export data for {selected.label}",
+            str(default),
+            "CSV table (*.csv);;Compressed NumPy archive (*.npz)",
+        )
+        if not path_text:
+            return
+        span = (selected.start, selected.end)
+        try:
+            path = Path(path_text)
+            if path.suffix.lower() == ".npz" or "NumPy" in selected_filter:
+                output = export_analysis_npz(
+                    path, self.analysis, self.geometry, time_range=span, bookmarks=self.bookmarks
+                )
+            else:
+                output = export_analysis_csv(
+                    path, self.analysis, self.geometry, time_range=span, bookmarks=self.bookmarks
+                )
+            self._set_status(f"Exported {selected.label} data to {output.name}.")
+        except Exception as exc:  # noqa: BLE001
+            self._show_error("Could not export region data", exc)
+
     def export_data_dialog(self) -> None:
         if self.analysis is None:
             return
@@ -2260,9 +2967,9 @@ class MainWindow(QMainWindow):
         try:
             path = Path(path_text)
             if path.suffix.lower() == ".npz" or "NumPy" in selected_filter:
-                output = export_analysis_npz(path, self.analysis, self.geometry)
+                output = export_analysis_npz(path, self.analysis, self.geometry, bookmarks=self.bookmarks)
             else:
-                output = export_analysis_csv(path, self.analysis, self.geometry)
+                output = export_analysis_csv(path, self.analysis, self.geometry, bookmarks=self.bookmarks)
             self._set_status(f"Exported analysis data to {output.name}.")
         except Exception as exc:  # noqa: BLE001
             self._show_error("Could not export analysis data", exc)
@@ -2415,6 +3122,8 @@ class MainWindow(QMainWindow):
                 "file_path": str(self.source_path) if self.source_path else "",
                 "current_time": self.current_time,
                 "theme": self.theme_name,
+                "bookmarks": bookmarks_to_payload(self.bookmarks),
+                "compare": self._compare_state(),
             }
         return state
 
@@ -2539,6 +3248,14 @@ class MainWindow(QMainWindow):
             session = state.get("session") if isinstance(state.get("session"), Mapping) else {}
             if "current_time" in session:
                 self.pending_seek = _safe_float(session.get("current_time"), 0.0)
+            if "compare" in session:
+                compare = session.get("compare")
+                self.pending_compare = dict(compare) if isinstance(compare, Mapping) else None
+            if "bookmarks" in session:
+                duration = float(self.analysis.duration) if self.analysis is not None else None
+                self.bookmarks = bookmarks_from_payload(session.get("bookmarks"), duration)
+                self._open_bookmark = None
+                self._refresh_bookmarks()
             theme = str(session.get("theme", "")).strip().lower()
             if theme in {"dark", "light"}:
                 self._set_theme(theme)
@@ -2667,6 +3384,7 @@ class MainWindow(QMainWindow):
         self.theme_name = theme
         if hasattr(self, "viewport"):
             self.viewport.set_theme(theme)
+            self.viewport_b.set_theme(theme)
         self.theme_button.setText("Dark mode" if theme == "light" else "Light mode")
         if persist:
             self.settings.setValue("theme", theme)
@@ -2685,6 +3403,8 @@ class MainWindow(QMainWindow):
         self.play_button.setEnabled(bool(ready and duration > 0.0))
         self._set_audio_controls_enabled(self._media_source_path is not None and self._media_has_audio)
         self.save_preset_button.setEnabled(True)
+        self._update_bookmark_buttons()
+        self._update_compare_button()
         self._update_reanalyze_state()
         if ready and self.source_path is not None:
             self.source_badge.setText(f"LOCAL / {self.source_path.name.upper()}")
@@ -2738,7 +3458,7 @@ class MainWindow(QMainWindow):
             self._schedule_preview()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
-        if self.analysis_thread is not None:
+        if self.analysis_thread is not None or self.compare_thread is not None:
             QMessageBox.information(
                 self,
                 "Analysis in progress",

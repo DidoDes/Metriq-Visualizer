@@ -30,22 +30,16 @@ def _json_write_atomic(path: Path, payload: Mapping[str, Any]) -> None:
 def build_project_payload(name: str, state: Mapping[str, Any], *, project_path: str | Path | None = None) -> dict[str, Any]:
     clean_state = deepcopy(dict(state))
     relative_source = ""
+    relative_compare = ""
     if project_path:
         project = Path(project_path).expanduser().resolve()
         session = clean_state.get("session")
         if isinstance(session, dict):
-            source_text = str(session.get("file_path", "")).strip()
-            if source_text:
-                source = Path(source_text).expanduser().resolve()
-                try:
-                    # ``relative_to`` only works for descendants. ``relpath``
-                    # also preserves sibling layouts such as ../media/source.wav.
-                    relative_source = os.path.relpath(source, project.parent)
-                except ValueError:
-                    # Different Windows drives cannot be represented as one
-                    # relative path; retain the absolute session path instead.
-                    relative_source = ""
-    return {
+            relative_source = _relative_to_project(session.get("file_path"), project)
+            compare = session.get("compare")
+            if isinstance(compare, dict):
+                relative_compare = _relative_to_project(compare.get("file_path"), project)
+    payload = {
         "schema": PROJECT_SCHEMA,
         "schema_version": PROJECT_SCHEMA_VERSION,
         "name": str(name or "Metriq Visualizer Project").strip(),
@@ -53,6 +47,32 @@ def build_project_payload(name: str, state: Mapping[str, Any], *, project_path: 
         "relative_source": relative_source,
         "state": clean_state,
     }
+    if relative_compare:
+        payload["relative_compare_source"] = relative_compare
+    return payload
+
+
+def _relative_to_project(source_text: Any, project: Path) -> str:
+    text = str(source_text or "").strip()
+    if not text:
+        return ""
+    source = Path(text).expanduser().resolve()
+    try:
+        # ``relative_to`` only works for descendants. ``relpath``
+        # also preserves sibling layouts such as ../media/source.wav.
+        return os.path.relpath(source, project.parent)
+    except ValueError:
+        # Different Windows drives cannot be represented as one
+        # relative path; retain the absolute session path instead.
+        return ""
+
+
+def _resolve_relative(relative: str, project_file: Path) -> Path | None:
+    text = str(relative or "").strip()
+    if not text:
+        return None
+    candidate = Path(text).expanduser() if text.startswith("~") else (project_file.parent / text)
+    return candidate.resolve() if candidate.exists() else None
 
 
 def save_project(path: str | Path, payload: Mapping[str, Any]) -> Path:
@@ -81,12 +101,15 @@ def load_project(path: str | Path) -> dict[str, Any]:
     result["state"] = deepcopy(dict(state))
 
     # Resolve a portable source reference before falling back to an absolute path.
-    relative = str(payload.get("relative_source", "")).strip()
     session = result["state"].get("session")
-    if isinstance(session, dict) and relative:
-        candidate = Path(relative).expanduser() if relative.startswith("~") else (source.parent / relative)
-        if candidate.exists():
-            session["file_path"] = str(candidate.resolve())
+    if isinstance(session, dict):
+        resolved = _resolve_relative(payload.get("relative_source", ""), source)
+        if resolved is not None:
+            session["file_path"] = str(resolved)
+        compare = session.get("compare")
+        resolved_compare = _resolve_relative(payload.get("relative_compare_source", ""), source)
+        if isinstance(compare, dict) and resolved_compare is not None:
+            compare["file_path"] = str(resolved_compare)
     return result
 
 
