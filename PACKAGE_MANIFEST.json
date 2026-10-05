@@ -471,9 +471,9 @@
     },
     {
       "path": "run_windows.bat",
-      "bytes": 383,
+      "bytes": 922,
       "mode": "0644",
-      "sha256": "67108e99ce736cddeba8ee5176be4f6b3e445bd46d4afcb047adbeafe3da2738"
+      "sha256": "6e5430f80763435ecc61ec7b4b76153bc0fe0ff407e4e9854a68aa27d90d3e0e"
     },
     {
       "path": "tests/test_3d.py",
