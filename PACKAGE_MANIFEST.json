@@ -5,7 +5,7 @@
   "generated_at": "2026-07-13T19:28:00+00:00",
   "self_included": false,
   "file_count": 96,
-  "total_bytes": 2820801,
+  "total_bytes": 2821793,
   "files": [
     {
       "path": ".gitattributes",
@@ -561,9 +561,9 @@
     },
     {
       "path": "tests/test_v1125_regressions.py",
-      "bytes": 21468,
+      "bytes": 22460,
       "mode": "0644",
-      "sha256": "e10fb1533e8e09ef9b07501fd3aa0ee7c29450e1d382dee389a56a76636ecf91"
+      "sha256": "65ff2be07cb5281e8de073de520c19d1d546b14c20f4cae17f4ebaca3ffe24d7"
     },
     {
       "path": "tests/test_visuals.py",
