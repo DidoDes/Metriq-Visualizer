@@ -1246,32 +1246,54 @@ def analyze_media(
 # Geometry construction
 
 
-def _normalize(values: np.ndarray, mode: str) -> np.ndarray:
+def _normalization_bounds(values: np.ndarray, mode: str) -> tuple[float, float]:
+    """Return ``(offset, scale)`` so that ``(values - offset) / scale`` normalizes *values*.
+
+    ``minmax`` uses the 1st–99th percentile span, the default robust z-score
+    uses the median and interquartile scale. A zero scale means "flat".
+    """
+
     array = _vector(values).astype(np.float64)
-    if array.size == 0:
-        return array.astype(np.float32)
-    if mode == "raw":
-        return np.clip(array, -1e6, 1e6).astype(np.float32)
+    if array.size == 0 or mode == "raw":
+        return 0.0, 1.0
     if mode == "minmax":
         low, high = np.percentile(array, [1.0, 99.0])
-        if high <= low + 1e-12:
-            return np.zeros(array.size, dtype=np.float32)
-        return (np.clip((array - low) / (high - low), 0.0, 1.0) * 2.0 - 1.0).astype(np.float32)
+        return float(low), float(high - low) if high > low + 1e-12 else 0.0
     median = float(np.median(array))
     q25, q75 = np.percentile(array, [25.0, 75.0])
     scale = float((q75 - q25) / 1.349)
     if scale <= 1e-12:
         scale = float(np.std(array))
+    return median, scale if scale > 1e-12 else 0.0
+
+
+def _normalize(values: np.ndarray, mode: str, bounds: tuple[float, float] | None = None) -> np.ndarray:
+    array = _vector(values).astype(np.float64)
+    if array.size == 0:
+        return array.astype(np.float32)
+    if mode == "raw":
+        return np.clip(array, -1e6, 1e6).astype(np.float32)
+    offset, scale = _normalization_bounds(array, mode) if bounds is None else bounds
     if scale <= 1e-12:
         return np.zeros(array.size, dtype=np.float32)
-    return np.clip((array - median) / scale, -6.0, 6.0).astype(np.float32)
+    if mode == "minmax":
+        return (np.clip((array - offset) / scale, 0.0, 1.0) * 2.0 - 1.0).astype(np.float32)
+    return np.clip((array - offset) / scale, -6.0, 6.0).astype(np.float32)
 
 
-def _color_map(values: np.ndarray, name: str) -> np.ndarray:
+def _percentile_bounds(values: np.ndarray, low: float, high: float) -> tuple[float, float]:
+    array = _vector(values).astype(np.float64)
+    if array.size == 0:
+        return 0.0, 0.0
+    lo, hi = np.percentile(array, [low, high])
+    return float(lo), float(hi)
+
+
+def _color_map(values: np.ndarray, name: str, bounds: tuple[float, float] | None = None) -> np.ndarray:
     array = _vector(values)
     if array.size == 0:
         return np.empty((0, 4), dtype=np.float32)
-    lo, hi = np.percentile(array, [1.0, 99.0])
+    lo, hi = _percentile_bounds(array, 1.0, 99.0) if bounds is None else bounds
     normalized = np.zeros_like(array) if hi <= lo + 1e-12 else np.clip((array - lo) / (hi - lo), 0.0, 1.0)
     try:
         from matplotlib import colormaps
@@ -1295,14 +1317,59 @@ def build_geometry(
     max_points: int = 3000,
     low_volume_cutoff_db: float = 0.0,
     colormap: str = "plasma",
+    reference: GeometryReference | None = None,
 ) -> GeometryResult:
-    length = int(analysis.times.size)
-    if length <= 0:
-        raise ValueError("The analysis contains no frames.")
+    """Map *analysis* features to 3D geometry.
+
+    Each axis, color and size is scaled from this source alone unless a
+    *reference* (see :func:`geometry_reference`) supplies shared bounds, which
+    puts two sources on one comparable scale.
+    """
+
     formulas = {
         "x": str(x_formula), "y": str(y_formula), "z": str(z_formula),
         "color": str(color_formula), "size": str(size_formula),
     }
+    raw, valid = _mapped_values(analysis, formulas, low_volume_cutoff_db)
+    source_indices = np.flatnonzero(valid)
+    if source_indices.size == 0:
+        raise ValueError("No frames remain after filtering. Reduce the low-volume cutoff or change the formulas.")
+
+    bounds = reference.bounds if reference is not None and reference.normalize_mode == str(normalize_mode) else {}
+    x_full = _normalize(raw["x"][valid], normalize_mode, bounds.get("x"))
+    y_full = _normalize(raw["y"][valid], normalize_mode, bounds.get("y"))
+    z_full = _normalize(raw["z"][valid], normalize_mode, bounds.get("z"))
+    color_full = raw["color"][valid].astype(np.float32)
+    size_raw = np.abs(raw["size"][valid].astype(np.float64))
+    size_lo, size_hi = bounds.get("size") or _percentile_bounds(size_raw, 5.0, 95.0)
+    if size_hi <= size_lo + 1e-12:
+        size_full = np.ones(size_raw.size, dtype=np.float32)
+    else:
+        size_full = (0.25 + 1.75 * np.clip((size_raw - size_lo) / (size_hi - size_lo), 0.0, 1.0)).astype(np.float32)
+    times_full = analysis.times[valid].astype(np.float32)
+    rgba_full = _color_map(color_full, colormap, bounds.get("color"))
+    return _sampled_geometry(
+        x_full, y_full, z_full, color_full, size_full, times_full, rgba_full, source_indices,
+        max_points=max_points, formulas=formulas, normalize_mode=normalize_mode, colormap=colormap,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GeometryReference:
+    """Shared scaling bounds so several sources map onto one comparable space."""
+
+    normalize_mode: str
+    bounds: dict[str, tuple[float, float]]
+
+
+def _mapped_values(
+    analysis: AnalysisResult,
+    formulas: Mapping[str, str],
+    low_volume_cutoff_db: float,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    length = int(analysis.times.size)
+    if length <= 0:
+        raise ValueError("The analysis contains no frames.")
     raw = {key: evaluate_formula(expression, analysis.features, length) for key, expression in formulas.items()}
     valid = np.ones(length, dtype=bool)
     for values in raw.values():
@@ -1316,23 +1383,55 @@ def build_geometry(
         else:
             level_db = np.zeros(length, dtype=np.float32)
         valid &= level_db >= -float(low_volume_cutoff_db)
-    source_indices = np.flatnonzero(valid)
-    if source_indices.size == 0:
-        raise ValueError("No frames remain after filtering. Reduce the low-volume cutoff or change the formulas.")
+    return raw, valid
 
-    x_full = _normalize(raw["x"][valid], normalize_mode)
-    y_full = _normalize(raw["y"][valid], normalize_mode)
-    z_full = _normalize(raw["z"][valid], normalize_mode)
-    color_full = raw["color"][valid].astype(np.float32)
-    size_raw = np.abs(raw["size"][valid].astype(np.float64))
-    size_lo, size_hi = np.percentile(size_raw, [5.0, 95.0])
-    if size_hi <= size_lo + 1e-12:
-        size_full = np.ones(size_raw.size, dtype=np.float32)
-    else:
-        size_full = (0.25 + 1.75 * np.clip((size_raw - size_lo) / (size_hi - size_lo), 0.0, 1.0)).astype(np.float32)
-    times_full = analysis.times[valid].astype(np.float32)
-    rgba_full = _color_map(color_full, colormap)
 
+def geometry_reference(
+    analyses: Sequence[AnalysisResult],
+    x_formula: str,
+    y_formula: str,
+    z_formula: str,
+    color_formula: str,
+    size_formula: str,
+    *,
+    normalize_mode: str = "zscore",
+    low_volume_cutoff_db: float = 0.0,
+) -> GeometryReference:
+    """Compute scaling bounds over every analysis combined.
+
+    Passing the result to :func:`build_geometry` for each source keeps their
+    relative loudness, pitch and spread visible instead of stretching each
+    one to fill the same box.
+    """
+
+    formulas = {"x": x_formula, "y": y_formula, "z": z_formula, "color": color_formula, "size": size_formula}
+    pooled: dict[str, list[np.ndarray]] = {key: [] for key in formulas}
+    for analysis in analyses:
+        raw, valid = _mapped_values(analysis, formulas, low_volume_cutoff_db)
+        for key in formulas:
+            pooled[key].append(raw[key][valid])
+    combined = {key: np.concatenate(parts) if parts else np.empty(0) for key, parts in pooled.items()}
+    bounds = {axis: _normalization_bounds(combined[axis], normalize_mode) for axis in ("x", "y", "z")}
+    bounds["color"] = _percentile_bounds(combined["color"], 1.0, 99.0)
+    bounds["size"] = _percentile_bounds(np.abs(combined["size"]), 5.0, 95.0)
+    return GeometryReference(normalize_mode=str(normalize_mode), bounds=bounds)
+
+
+def _sampled_geometry(
+    x_full: np.ndarray,
+    y_full: np.ndarray,
+    z_full: np.ndarray,
+    color_full: np.ndarray,
+    size_full: np.ndarray,
+    times_full: np.ndarray,
+    rgba_full: np.ndarray,
+    source_indices: np.ndarray,
+    *,
+    max_points: int,
+    formulas: dict[str, str],
+    normalize_mode: str,
+    colormap: str,
+) -> GeometryResult:
     target = max(1, min(int(max_points), source_indices.size))
     if target < source_indices.size:
         plot_positions = np.unique(np.linspace(0, source_indices.size - 1, target, dtype=np.int64))
@@ -1396,6 +1495,7 @@ __all__ = [
     "DEFAULT_PRESETS",
     "FEATURE_DESCRIPTIONS",
     "FormulaError",
+    "GeometryReference",
     "GeometryResult",
     "TABLE_EXTENSIONS",
     "VIDEO_EXTENSIONS",
@@ -1404,5 +1504,6 @@ __all__ = [
     "build_geometry",
     "evaluate_formula",
     "format_feature_reference",
+    "geometry_reference",
     "is_table_file",
 ]

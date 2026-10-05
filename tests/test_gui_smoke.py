@@ -545,6 +545,178 @@ class GuiSmokeTests(unittest.TestCase):
         window.close()
         self.app.processEvents()
 
+    def _wait_for_compare(self, window: MainWindow, timeout: float = 30.0) -> None:
+        deadline = time.monotonic() + timeout
+        while window.compare_thread is not None and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.app.processEvents()
+        self.assertIsNone(window.compare_thread, "source B analysis did not finish")
+        window._render_preview()
+        self.app.processEvents()
+
+    def _compare_sources(self) -> tuple[Path, Path]:
+        quiet = Path(self.temp.name) / "compare-a.csv"
+        loud = Path(self.temp.name) / "compare-b.csv"
+        quiet.write_text(
+            "time,a,b,c\n"
+            + "\n".join(f"{i / 30:.6f},{np.sin(i / 8):.6f},{np.cos(i / 11):.6f},{i % 17}" for i in range(240)),
+            encoding="utf-8",
+        )
+        loud.write_text(
+            "time,a,b,c\n"
+            + "\n".join(f"{i / 30:.6f},{3 * np.sin(i / 8):.6f},{np.cos(i / 11):.6f},{i % 17}" for i in range(150)),
+            encoding="utf-8",
+        )
+        return quiet, loud
+
+    def test_compare_shows_source_b_with_shared_scale_linked_camera_and_offset(self) -> None:
+        source_a, source_b = self._compare_sources()
+        window = MainWindow()
+        window.resize(1540, 940)
+        window.show()
+        window._start_analysis(source_a)
+        self._wait_for_analysis(window)
+        self.assertEqual(window.compare_button.text(), "Compare")
+        self.assertTrue(window.viewport_b.parentWidget().isHidden())
+        window.x_edit.setText("a")
+        window.rebuild_geometry()
+
+        window.start_compare(source_b)
+        self._wait_for_compare(window)
+        assert window.geometry is not None and window.compare_geometry is not None
+        self.assertFalse(window.viewport_b.parentWidget().isHidden())
+        self.assertIsNotNone(window.viewport_b.scene)
+        self.assertEqual(window.compare_button.text(), "End compare")
+        shared_a = float(np.ptp(window.geometry.x_full))
+        shared_b = float(np.ptp(window.compare_geometry.x_full))
+        self.assertGreater(shared_b, shared_a * 2.0)
+
+        window.compare_shared_check.setChecked(False)
+        window.rebuild_geometry()
+        assert window.geometry is not None and window.compare_geometry is not None
+        self.assertAlmostEqual(
+            float(np.ptp(window.compare_geometry.x_full)), float(np.ptp(window.geometry.x_full)), delta=0.6
+        )
+        window.compare_shared_check.setChecked(True)
+        window.rebuild_geometry()
+        window._render_preview()
+
+        # Dragging either camera moves both.
+        window.viewport.set_camera(12.0, 48.0, 1.3)
+        self.assertEqual(tuple(round(v, 3) for v in window.viewport_b.camera()), (12.0, 48.0, 1.3))
+        window.viewport_b.set_camera(30.0, -20.0, 0.9)
+        self.assertEqual(tuple(round(v, 3) for v in window.viewport.camera()), (30.0, -20.0, 0.9))
+        self.assertAlmostEqual(window.elev_spin.value(), 30.0)
+
+        # B runs on A's clock shifted by the offset and clamped to its own length.
+        window.compare_offset_spin.setValue(1.0)
+        window._seek_seconds(3.0)
+        self.assertAlmostEqual(window._compare_time(), 2.0)
+        window._seek_seconds(0.5)
+        self.assertEqual(window._compare_time(), 0.0)
+        window._seek_seconds(7.5)
+        self.assertAlmostEqual(window._compare_time(), window.compare_analysis.duration)
+
+        window._seek_seconds(0.0)
+        b_frames = 0
+        original_update = window.viewport_b.update_time
+
+        def counted(*args, **kwargs):
+            nonlocal b_frames
+            b_frames += 1
+            return original_update(*args, **kwargs)
+
+        window.viewport_b.update_time = counted  # type: ignore[method-assign]
+        window.toggle_playback()
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        window.stop_playback()
+        self.assertGreaterEqual(b_frames, 2)
+
+        # Every analysis panel stacks B under A on the shared, offset timeline.
+        spectrogram = window.analysis_dock.spectrogram
+        self.assertEqual(len(spectrogram.axes), 2)
+        self.assertEqual(len(spectrogram.cursors), 2)
+        b_extent = spectrogram.axes[1].images[0].get_extent()
+        self.assertAlmostEqual(b_extent[0], 1.0)
+        window.compare_offset_spin.setValue(0.5)
+        self.assertAlmostEqual(window.analysis_dock.spectrogram.axes[1].images[0].get_extent()[0], 0.5)
+        window.compare_offset_spin.setValue(1.0)
+
+        state = window._capture_state(include_session=True)
+        self.assertEqual(state["session"]["compare"]["offset"], 1.0)
+        self.assertEqual(Path(state["session"]["compare"]["file_path"]), source_b.resolve())
+
+        window.toggle_compare()
+        self.assertIsNone(window.compare_path)
+        self.assertTrue(window.viewport_b.parentWidget().isHidden())
+        self.assertEqual(len(window.analysis_dock.spectrogram.axes), 1)
+        self.assertIsNone(window._capture_state(include_session=True)["session"]["compare"])
+        window.close()
+        self.app.processEvents()
+
+        restored = MainWindow()
+        restored._start_analysis(source_a, state=state)
+        self._wait_for_analysis(restored)
+        self._wait_for_compare(restored)
+        self.assertEqual(restored.compare_path, source_b.resolve())
+        self.assertEqual(restored.compare_offset_spin.value(), 1.0)
+        self.assertIsNotNone(restored.compare_geometry)
+        # Opening an unrelated source ends the comparison.
+        restored._start_analysis(self._bookmark_source("compare-other.csv"))
+        self._wait_for_analysis(restored)
+        self.assertIsNone(restored.compare_path)
+        restored.close()
+        self.app.processEvents()
+
+    def test_compare_mapping_shows_one_source_with_two_formula_sets(self) -> None:
+        source_a, _source_b = self._compare_sources()
+        window = MainWindow()
+        window._start_analysis(source_a)
+        self._wait_for_analysis(window)
+        window.x_edit.setText("a")
+        window.rebuild_geometry()
+        window.start_compare_mapping({"x": "b"})
+        self.assertEqual(window.compare_mode, "mapping")
+        self.assertIs(window.compare_analysis, window.analysis)
+        self.assertFalse(window.compare_mapping_box.isHidden())
+        self.assertFalse(window.compare_shared_check.isEnabled())
+        self.assertEqual(window.compare_formula_edits["x"].text(), "b")
+        self.assertEqual(window.compare_formula_edits["y"].text(), window.y_edit.text())
+        assert window.geometry is not None and window.compare_geometry is not None
+        self.assertEqual(window.geometry.formulas["x"], "a")
+        self.assertEqual(window.compare_geometry.formulas["x"], "b")
+        window._render_preview()
+        self.assertIsNotNone(window.viewport_b.scene)
+
+        window.compare_formula_edits["z"].setText("c")
+        window.rebuild_geometry()
+        assert window.compare_geometry is not None
+        self.assertEqual(window.compare_geometry.formulas["z"], "c")
+
+        state = window._capture_state(include_session=True)
+        compare = state["session"]["compare"]
+        self.assertEqual(compare["mode"], "mapping")
+        self.assertEqual(compare["formulas"]["z"], "c")
+        self.assertNotIn("file_path", compare)
+        window.toggle_compare()
+        self.assertEqual(window.compare_mode, "source")
+        self.assertTrue(window.compare_mapping_box.isHidden())
+        window.close()
+        self.app.processEvents()
+
+        restored = MainWindow()
+        restored._start_analysis(source_a, state=state)
+        self._wait_for_analysis(restored)
+        self.assertEqual(restored.compare_mode, "mapping")
+        assert restored.compare_geometry is not None
+        self.assertEqual(restored.compare_geometry.formulas["x"], "b")
+        restored.close()
+        self.app.processEvents()
+
     def test_export_format_switch_preserves_video_and_jpeg_quality(self) -> None:
         source = Path(self.temp.name) / "format-source.csv"
         source.write_text("time,a,b\n0,1,2\n1,2,3\n2,3,5\n", encoding="utf-8")

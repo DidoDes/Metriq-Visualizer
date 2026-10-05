@@ -17,6 +17,7 @@ from metriq_visualizer_core import (
     analyze_media,
     build_geometry,
     evaluate_formula,
+    geometry_reference,
     is_table_file,
 )
 
@@ -93,6 +94,42 @@ class AnalysisAndGeometryTests(unittest.TestCase):
                 self.assertIn(alias, analysis.features)
                 self.assertEqual(analysis.features[alias].shape, analysis.times.shape)
 
+
+    def test_shared_reference_keeps_relative_scale_between_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            quiet = root / "quiet.csv"
+            loud = root / "loud.csv"
+            rows = range(200)
+            quiet.write_text(
+                "time,a,b\n" + "\n".join(f"{i / 10},{np.sin(i / 7):.6f},{np.cos(i / 5):.6f}" for i in rows),
+                encoding="utf-8",
+            )
+            loud.write_text(
+                "time,a,b\n" + "\n".join(f"{i / 10},{2 * np.sin(i / 7):.6f},{np.cos(i / 5):.6f}" for i in rows),
+                encoding="utf-8",
+            )
+            a = analysis_from_table_file(quiet)
+            b = analysis_from_table_file(loud)
+            formulas = ("a", "b", "a", "a", "b")
+            for mode in ("zscore", "minmax"):
+                separate_a = build_geometry(a, *formulas, normalize_mode=mode)
+                separate_b = build_geometry(b, *formulas, normalize_mode=mode)
+                np.testing.assert_allclose(separate_a.x_full, separate_b.x_full, atol=1e-4)
+
+                reference = geometry_reference([a, b], *formulas, normalize_mode=mode)
+                shared_a = build_geometry(a, *formulas, normalize_mode=mode, reference=reference)
+                shared_b = build_geometry(b, *formulas, normalize_mode=mode, reference=reference)
+                spread_a = float(np.ptp(shared_a.x_full))
+                spread_b = float(np.ptp(shared_b.x_full))
+                self.assertGreater(spread_b, spread_a * 1.6, mode)
+                # The unchanged axis stays identical between the two sources.
+                np.testing.assert_allclose(shared_a.y_full, shared_b.y_full, atol=1e-4)
+
+            # A reference built for another normalization mode is ignored.
+            zscore_reference = geometry_reference([a, b], *formulas, normalize_mode="zscore")
+            ignored = build_geometry(b, *formulas, normalize_mode="minmax", reference=zscore_reference)
+            np.testing.assert_allclose(ignored.x_full, build_geometry(b, *formulas, normalize_mode="minmax").x_full)
 
     def test_stft_frame_count_is_bounded_for_long_sources(self) -> None:
         samples = np.zeros(400_000, dtype=np.float32)

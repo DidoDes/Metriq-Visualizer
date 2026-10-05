@@ -9,6 +9,10 @@
 - Analysis panels shade bookmark regions and mark points; click a panel to seek, or shift-drag across it to create a region.
 - "Export region data" writes analyzed and mapped data for the selected region only; full data exports gain a `bookmark` column (CSV) or bookmark metadata (NPZ) when bookmarks exist.
 - Export Studio offers bookmark regions as ready-made time ranges, preselecting the region chosen in the Data tab.
+- A/B compare: Compare in the Data tab (Ctrl+B) analyzes a second source with the same settings and shows it beside the first. Both 3D views share one camera and one clock, B can be offset in time, and every analysis panel stacks B under A.
+- "Scale A and B together" (on by default) maps both sources onto one scale, so a louder or wider source looks larger instead of each filling the space on its own.
+- Compare mapping shows the same source twice with a second set of formulas.
+- The comparison is saved in projects and sessions (`state.session.compare`, with a portable `relative_compare_source`).
 - Bookmarks are saved in projects and the recoverable session (`state.session.bookmarks`, project schema unchanged) and never in visual presets.
 
 ## 1.12.8 — Windows release validation

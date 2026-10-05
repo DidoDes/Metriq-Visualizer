@@ -44,6 +44,43 @@ class PersistenceTests(unittest.TestCase):
                 moved_source.resolve(),
             )
 
+    def test_project_stores_compare_source_relative_to_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "media" / "a.wav"
+            compare = root / "media" / "b.wav"
+            source.parent.mkdir()
+            source.write_bytes(b"RIFF")
+            compare.write_bytes(b"RIFF")
+            project_path = root / "projects" / "ab.mvproj"
+            project_path.parent.mkdir()
+            state = {
+                "session": {
+                    "file_path": str(source),
+                    "compare": {"file_path": str(compare), "offset": 0.5, "shared_scale": True},
+                    "bookmarks": [{"start": 1.0, "end": 2.0, "label": "Intro"}],
+                }
+            }
+            payload = build_project_payload("AB", state, project_path=project_path)
+            self.assertEqual(Path(payload["relative_compare_source"]), Path("../media/b.wav"))
+            saved = save_project(project_path, payload)
+
+            moved = root / "moved"
+            (moved / "media").mkdir(parents=True)
+            (moved / "projects").mkdir()
+            for name in ("a.wav", "b.wav"):
+                (moved / "media" / name).write_bytes(b"RIFF")
+            moved_project = moved / "projects" / "ab.mvproj"
+            moved_project.write_bytes(saved.read_bytes())
+            source.unlink()
+            compare.unlink()
+            loaded = load_project(moved_project)
+            session = loaded["state"]["session"]
+            self.assertEqual(Path(session["compare"]["file_path"]), (moved / "media" / "b.wav").resolve())
+            self.assertEqual(session["compare"]["offset"], 0.5)
+            self.assertEqual(session["bookmarks"][0]["label"], "Intro")
+            self.assertEqual(loaded["schema_version"], 2)
+
     def test_preset_removes_session_data(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state = {"session": {"file_path": "/private/source.wav"}, "mapping": {"x": "pc1"}}
