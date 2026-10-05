@@ -5,7 +5,6 @@ import plistlib
 import runpy
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,6 +46,24 @@ from metriq_visualizer_realtime import (  # noqa: E402
     media_path_segments,
 )
 from metriq_visualizer_render import ExportOptions  # noqa: E402
+
+
+class _ScriptedElapsedClock:
+    """Stand-in for ``QElapsedTimer`` that reports scripted elapsed milliseconds."""
+
+    def __init__(self, elapsed_ms: list[int]) -> None:
+        self._elapsed_ms = list(elapsed_ms)
+        self.restarts = 0
+
+    def isValid(self) -> bool:  # noqa: N802 - mirrors the Qt API
+        return True
+
+    def start(self) -> None:
+        pass
+
+    def restart(self) -> int:
+        self.restarts += 1
+        return self._elapsed_ms.pop(0)
 
 
 class CameraAndMotionRegressionTests(unittest.TestCase):
@@ -107,13 +124,22 @@ class CameraAndMotionRegressionTests(unittest.TestCase):
         viewport.set_live_trajectory(points, options=options)
         viewport.set_motion_frame_interval(67)
         self.assertEqual(viewport.autorotate_timer.interval(), 67)
+        self.assertTrue(viewport.autorotate_timer.isActive())
+
+        # Drive the timer by hand with a scripted clock so the check does not
+        # depend on how quickly the event loop runs under load.
+        clock = _ScriptedElapsedClock([100, 250])
+        viewport.autorotate_clock = clock
         start = viewport.camera()[1]
-        deadline = time.monotonic() + 0.18
-        while time.monotonic() < deadline:
-            self.app.processEvents()
-            time.sleep(0.005)
-        end = viewport.camera()[1]
-        self.assertGreater(abs(end - start), 3.0)
+        viewport.autorotate_timer.timeout.emit()
+        after_first = viewport.camera()[1]
+        viewport.autorotate_timer.timeout.emit()
+        after_second = viewport.camera()[1]
+
+        # 120 deg/s: the advance follows elapsed time, not the tick count.
+        self.assertEqual(clock.restarts, 2)
+        self.assertAlmostEqual(after_first, advance_azimuth(start, 120.0, 0.100))
+        self.assertAlmostEqual(after_second, advance_azimuth(after_first, 120.0, 0.250))
         viewport.clear_scene()
 
     def test_realtime_drag_latches_fast_canvas_until_release(self) -> None:
